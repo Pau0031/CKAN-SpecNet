@@ -14,7 +14,8 @@ Install required dependencies: `python >=3.12` && `pytorch>=2.2`
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install numpy pandas scikit-learn matplotlib seaborn kan-torch grad-cam
+pip install numpy pandas scikit-learn matplotlib seaborn grad-cam
+pip install https://github.com/Simon-Bertrand/KAN-PyTorch/archive/main.zip
 ```
 
 ## Running the Framework
