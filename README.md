@@ -1,6 +1,6 @@
 # CKAN-SpecNet
 
-**KAN-Enhanced CNN Framework for Multi-Task MIR Spectral Analysis**
+**CKAN-SpecNet: Intelligent Decoding of Functional Group Multiplicity and Substructural Isomerism from Infrared Spectroscopy via Deep Neural Networks**
 
 A deep learning architecture combining Kolmogorov-Arnold Networks with CNNs for functional group enumeration and isomer identification from mid-infrared spectra.
 
