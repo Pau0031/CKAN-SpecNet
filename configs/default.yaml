@@ -1,0 +1,68 @@
+model:
+  input_size: 1801
+  conv_channels: [32, 64, 128, 256]
+  conv_kernels: [15, 13, 11, 5]
+  pool_sizes: [3, 2, null, null]
+  eca_positions: [2, 3]
+  adaptive_pool_size: 64
+  fc_hidden: 1024
+  kan_hidden: 256
+  dropout_fc: 0.7
+  dropout_head: 0.3
+
+training:
+  epochs: 500
+  batch_size: 1024
+  learning_rate: 0.001
+  weight_decay: 0.05
+  patience: 50
+  use_mixup: true
+  mixup_alpha: 1.0
+  mixup_p: 0.5
+  use_smoothness: true
+  lambda_smooth: 0.01
+
+data:
+  test_size: 0.2
+  random_state: 42
+  n_folds: 5
+
+tasks:
+  binary:
+    - alkane
+    - alkene
+    - alkyne
+    - aromatics
+    - esters
+    - ketones
+    - ortho
+    - meta
+    - para
+    - alkyl_halides
+    - alcohols
+    - ether
+    - amines
+    - carbonyl_oxygen
+    - aldehydes
+    - acyl_halides
+    - amides
+    - nitriles
+    - nitro
+    - isocyanate
+    - isothiocyanate
+
+  ternary:
+    - aldehydes
+    - acyl_halides
+    - amides
+    - nitriles
+    - nitro
+    - isocyanate
+    - isothiocyanate
+
+  quaternary:
+    - alkyl_halides
+    - alcohols
+    - ether
+    - amines
+    - carbonyl_oxygen

@@ -1,8 +1,8 @@
 # CKAN-SpecNet
 
-**CKAN-SpecNet: Intelligent Decoding of Functional Group Multiplicity and Substructural Isomerism from Infrared Spectroscopy via Deep Neural Networks**
+**Intelligent Decoding of Functional Group Multiplicity and Substructural Isomerism from Infrared Spectroscopy via Deep Neural Networks**
 
-A deep learning architecture combining Kolmogorov-Arnold Networks with CNNs for functional group enumeration and isomer identification from mid-infrared spectra.
+A deep learning architecture combining Kolmogorov-Arnold Networks (KAN) with CNNs for functional group enumeration and isomer identification from mid-infrared spectra.
 
 ## Overview
 
@@ -10,22 +10,55 @@ CKAN-SpecNet integrates CNN feature extraction with KAN decision-making to tackl
 
 ## Quick Start
 
-Install required dependencies: `python >=3.12` && `pytorch>=2.2`
+### Requirements
+
+- Python >= 3.12
+- PyTorch >= 2.2
+
+### Installation
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install numpy pandas scikit-learn matplotlib seaborn grad-cam
-pip install https://github.com/Simon-Bertrand/KAN-PyTorch/archive/main.zip
+pip install numpy pandas polars scikit-learn matplotlib seaborn
+pip install efficient-kan
 ```
 
-## Running the Framework
+### Running
 
-1. **Launch Jupyter Lab:**
 ```bash
-jupyter-lab
+python scripts/train.py --config configs/default.yaml
 ```
 
-2. **Execute notebooks in sequence:**
+Or use Jupyter notebooks:
+
 ```bash
-*.ipynb
+jupyter-lab notebooks/
 ```
+
+## Project Structure
+
+```
+CKAN-SpecNet/
+├── ckan_specnet/
+│   ├── models.py          # Model architectures
+│   ├── dataset.py         # Data loading
+│   ├── losses.py          # Loss functions
+│   └── utils.py           # Helper functions
+├── configs/
+│   └── default.yaml       # Configuration
+├── scripts/
+│   ├── train.py           # Training script
+│   └── predict.py         # Inference script
+├── notebooks/
+│   └── train_demo.ipynb   # Demo notebook
+├── data/                  # Dataset files
+└── results/               # Output predictions
+```
+
+## Citation
+
+If you use this code, please cite our work.
+
+## License
+
+MIT License
