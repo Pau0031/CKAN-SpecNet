@@ -19,7 +19,7 @@ wheels/
 .installed.cfg
 *.egg
 
-*.parquet
+# *.parquet
 *.pth
 *.pt
 
