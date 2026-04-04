@@ -20,7 +20,6 @@ CKAN-SpecNet integrates CNN feature extraction with KAN decision-making to tackl
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install numpy pandas polars scikit-learn matplotlib seaborn
-pip install efficient-kan
 ```
 
 ### Running
@@ -32,7 +31,7 @@ python scripts/train.py --config configs/default.yaml
 Or use Jupyter notebooks:
 
 ```bash
-jupyter-lab notebooks/
+jupyter-lab
 ```
 
 ## Project Structure
@@ -52,13 +51,4 @@ CKAN-SpecNet/
 ├── notebooks/
 │   └── train_demo.ipynb   # Demo notebook
 ├── data/                  # Dataset files
-└── results/               # Output predictions
 ```
-
-## Citation
-
-If you use this code, please cite our work.
-
-## License
-
-MIT License
