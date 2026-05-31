@@ -112,8 +112,6 @@ xps_digitized    digitized external spectra
 
 `swgdrug` and the digitized external spectra are not used for training and are only used for external robustness evaluation.
 
-All spectra are represented on a unified IR grid.
-
 Main fields:
 
 ```text
@@ -130,6 +128,178 @@ label columns     functional-group presence/count labels
 ```
 
 The label columns include binary functional-group presence labels and coarse-grained count labels, such as `_3class` and `_4class` tasks.
+
+## Custom Test Data Format
+
+You can construct your own evaluation file following the same format as `data/test.parquet`.
+
+The file must be a Parquet file with one row per spectrum. Each row should contain:
+
+- a spectrum vector;
+- metadata columns;
+- an evaluation subset name;
+- a unique sample identifier;
+- functional-group label columns.
+
+The `spectrum` column must follow the same length, order, and preprocessing convention as the released `data/test.parquet`.
+
+TODO: describe the exact spectrum grid and resampling procedure if custom raw spectra need to be converted.
+
+Required columns:
+
+```text
+spectrum          IR spectrum vector
+source_name       data source name
+component_count   number of molecular components
+_eval_name        evaluation subset name
+_sample_id        unique sample identifier
+label columns     functional-group count labels
+```
+
+Recommended metadata columns:
+
+```text
+source_record_id  original source record identifier
+source_path       local source path or generated source path
+compound_name     compound name when available
+smiles            SMILES
+```
+
+The evaluation script groups rows by `_eval_name`. You may use any subset name for custom data, for example:
+
+```text
+custom_test
+external_test
+instrument_export
+```
+
+Each unique `_eval_name` value will be evaluated separately.
+
+The label columns must use the base task names below:
+
+```text
+alkane
+alkene
+alkyne
+aromatics
+esters
+ketones
+ortho
+meta
+para
+alkyl_halides
+alcohols
+ether
+amines
+carbonyl_oxygen
+aldehydes
+acyl_halides
+amides
+nitriles
+nitro
+isocyanate
+isothiocyanate
+```
+
+Label values should be non-negative integer counts.
+
+For binary presence tasks, values are clipped to 0 or 1 during evaluation.
+
+For `_3class` tasks, values are clipped to:
+
+```text
+0    absent
+1    one
+2    two or more
+```
+
+The `_3class` tasks are generated from these base columns:
+
+```text
+aldehydes
+acyl_halides
+amides
+nitriles
+nitro
+isocyanate
+isothiocyanate
+```
+
+For `_4class` tasks, values are clipped to:
+
+```text
+0    absent
+1    one
+2    two
+3    three or more
+```
+
+The `_4class` tasks are generated from these base columns:
+
+```text
+alkyl_halides
+alcohols
+ether
+amines
+carbonyl_oxygen
+```
+
+A minimal example for creating a compatible Parquet file:
+
+```python
+from pathlib import Path
+
+import polars as pl
+
+label_columns = [
+    "alkane",
+    "alkene",
+    "alkyne",
+    "aromatics",
+    "esters",
+    "ketones",
+    "ortho",
+    "meta",
+    "para",
+    "alkyl_halides",
+    "alcohols",
+    "ether",
+    "amines",
+    "carbonyl_oxygen",
+    "aldehydes",
+    "acyl_halides",
+    "amides",
+    "nitriles",
+    "nitro",
+    "isocyanate",
+    "isothiocyanate",
+]
+
+spectrum = []  # TODO: use a spectrum vector compatible with data/test.parquet
+
+row = {
+    "spectrum": spectrum,
+    "source_name": "custom",
+    "source_record_id": "custom_0001",
+    "source_path": "custom/custom_0001",
+    "compound_name": "example compound",
+    "smiles": "",
+    "component_count": 1,
+    "_eval_name": "custom_test",
+    "_sample_id": "custom|custom_0001",
+    **{column: 0 for column in label_columns},
+}
+
+df = pl.DataFrame([row])
+Path("data").mkdir(exist_ok=True)
+df.write_parquet("data/custom_test.parquet")
+```
+
+Evaluate the custom file with the released models:
+
+```bash
+uv run python scripts/evaluate.py --test data/custom_test.parquet --run-dir models/ckan_specnet_5fold --out results/custom_test
+```
 
 ## Evaluation
 
