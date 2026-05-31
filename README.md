@@ -22,7 +22,7 @@ The released evaluation data and released five-fold model files can be downloade
 
 https://drive.google.com/drive/folders/1IC4L3ZADsPZVhuhMxcmgmN8wykg2d1Wk?usp=drive_link
 
-After downloading, place the released evaluation data at:
+After downloading, place the evaluation data at:
 
 ```text
 data/test.parquet
@@ -83,7 +83,7 @@ summary.csv                    overall metrics for each evaluation subset
 *_fold_summaries.csv           fold-level summary metrics
 ```
 
-Evaluation subsets:
+Evaluation subsets in the released data:
 
 ```text
 main_test        held-out NIST/SDBS pure-compound spectra
@@ -127,127 +127,6 @@ uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run
 uv run python scripts/plot_transition_evidence.py --help
 ```
 
-## Custom Evaluation Data Format
-
-You can construct your own evaluation file following the same format as `data/test.parquet`.
-
-The file must be a Parquet file with one row per spectrum. Each row should contain:
-
-- a spectrum vector;
-- metadata columns;
-- an evaluation subset name;
-- a unique sample identifier;
-- functional-group label columns.
-
-The `spectrum` column must follow the same length, order, and preprocessing convention as the released `data/test.parquet`.
-
-TODO: describe the exact spectrum grid and resampling procedure if custom raw spectra need to be converted.
-
-Required columns:
-
-```text
-spectrum          IR spectrum vector
-source_name       data source name
-component_count   number of molecular components
-_eval_name        evaluation subset name
-_sample_id        unique sample identifier
-label columns     functional-group count labels
-```
-
-Recommended metadata columns:
-
-```text
-source_record_id  original source record identifier
-source_path       local source path or generated source path
-compound_name     compound name when available
-smiles            SMILES
-```
-
-The evaluation script groups rows by `_eval_name`. You may use any subset name for custom data, for example:
-
-```text
-custom_test
-external_test
-instrument_export
-```
-
-Each unique `_eval_name` value will be evaluated separately.
-
-The label columns must use the base task names below:
-
-```text
-alkane
-alkene
-alkyne
-aromatics
-esters
-ketones
-ortho
-meta
-para
-alkyl_halides
-alcohols
-ether
-amines
-carbonyl_oxygen
-aldehydes
-acyl_halides
-amides
-nitriles
-nitro
-isocyanate
-isothiocyanate
-```
-
-Label values should be non-negative integer counts.
-
-For binary presence tasks, values are clipped to 0 or 1 during evaluation.
-
-For `_3class` tasks, values are clipped to:
-
-```text
-0    absent
-1    one
-2    two or more
-```
-
-The `_3class` tasks are generated from these base columns:
-
-```text
-aldehydes
-acyl_halides
-amides
-nitriles
-nitro
-isocyanate
-isothiocyanate
-```
-
-For `_4class` tasks, values are clipped to:
-
-```text
-0    absent
-1    one
-2    two
-3    three or more
-```
-
-The `_4class` tasks are generated from these base columns:
-
-```text
-alkyl_halides
-alcohols
-ether
-amines
-carbonyl_oxygen
-```
-
-Evaluate a custom evaluation file with the released models:
-
-```bash
-uv run python scripts/evaluate.py --test data/custom_test.parquet --run-dir models/ckan_specnet_5fold --out results/custom_test
-```
-
 ## Digitization
 
 The digitization utility converts an IR spectrum image into a numerical spectrum. Axis tick labels are recognized with `python-doctr`, and the extracted curve is saved together with diagnostic figures.
@@ -273,9 +152,9 @@ Supported image inputs include common formats such as PNG, JPG, JPEG, BMP, TIFF,
 uv run python scripts/digitize.py --help
 ```
 
-## Evaluation Data
+## Released Evaluation Data
 
-`data/test.parquet` is the fixed released evaluation data file. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
+`data/test.parquet` is the fixed released evaluation data file. It contains spectra, labels, source information, and evaluation subset identifiers.
 
 Evaluation subsets are distinguished by `_eval_name`:
 
