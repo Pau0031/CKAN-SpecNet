@@ -18,11 +18,11 @@ uv sync --extra digitization
 
 ## Required Files
 
-The public test set and released five-fold model files can be downloaded from Google Drive:
+The released evaluation data and released five-fold model files can be downloaded from Google Drive:
 
 https://drive.google.com/drive/folders/1IC4L3ZADsPZVhuhMxcmgmN8wykg2d1Wk?usp=drive_link
 
-After downloading, place the public test set at:
+After downloading, place the released evaluation data at:
 
 ```text
 data/test.parquet
@@ -44,7 +44,7 @@ models/ckan_specnet_5fold/
 
 ## Evaluation
 
-Run the released five-fold ensemble on the public test set:
+Run the released five-fold ensemble on the released evaluation data:
 
 ```bash
 uv run python scripts/evaluate.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --out results/reproduce
@@ -127,7 +127,7 @@ uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run
 uv run python scripts/plot_transition_evidence.py --help
 ```
 
-## Custom Test Data Format
+## Custom Evaluation Data Format
 
 You can construct your own evaluation file following the same format as `data/test.parquet`.
 
@@ -242,7 +242,7 @@ amines
 carbonyl_oxygen
 ```
 
-Evaluate a custom file with the released models:
+Evaluate a custom evaluation file with the released models:
 
 ```bash
 uv run python scripts/evaluate.py --test data/custom_test.parquet --run-dir models/ckan_specnet_5fold --out results/custom_test
@@ -273,9 +273,9 @@ Supported image inputs include common formats such as PNG, JPG, JPEG, BMP, TIFF,
 uv run python scripts/digitize.py --help
 ```
 
-## Test Set
+## Evaluation Data
 
-`data/test.parquet` is the fixed public evaluation set. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
+`data/test.parquet` is the fixed released evaluation data file. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
 
 Evaluation subsets are distinguished by `_eval_name`:
 
@@ -294,7 +294,7 @@ swgdrug          SWGDRUG spectra
 xps_digitized    digitized external spectra
 ```
 
-`main_test` comes from the model-development sources and consists of NIST gas-phase IR and SDBS spectra. During training reproduction, samples in `test.parquet` are excluded by `_sample_id`.
+`main_test` comes from the model-development sources and consists of NIST gas-phase IR and SDBS spectra. During training reproduction, samples in `data/test.parquet` are excluded by `_sample_id`.
 
 `swgdrug` and the digitized external spectra are not used for training and are only used for external robustness evaluation.
 
@@ -356,9 +356,9 @@ The data used in this study were collected from:
 - SDBS acquisition method adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
 - SWGDRUG: https://www.swgdrug.org
 
-The released `test.parquet` also contains digitized spectra from commercial instrument exports.
+The released `data/test.parquet` also contains digitized spectra from commercial instrument exports.
 
-Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `test.parquet` is provided for direct evaluation reproduction.
+Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `data/test.parquet` is provided for direct evaluation reproduction.
 
 ## Training
 
@@ -366,7 +366,7 @@ Some raw data are not redistributed in this repository because the original data
 uv run python scripts/train.py --parquet data/unified.parquet --test data/test.parquet --out results/new_run
 ```
 
-Samples in `test.parquet` are excluded during training.
+Samples in `data/test.parquet` are excluded during training.
 
 ```bash
 uv run python scripts/train.py --help
