@@ -1,0 +1,4532 @@
+
+================================================================================
+File: ./.gitignore
+================================================================================
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+env/
+.env
+.env.*
+
+.ipynb_checkpoints/
+*.ipynb
+
+.DS_Store
+Thumbs.db
+
+tmp/
+scratch/
+
+results/*
+!results/.gitkeep
+
+runs/
+
+data/*.parquet
+!data/.gitkeep
+
+models/ckan_specnet_5fold/*
+!models/ckan_specnet_5fold/.gitkeep
+
+================================================================================
+File: ./.gitattributes
+================================================================================
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.parquet binary
+*.pt binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.xps binary
+
+
+================================================================================
+File: ./scripts/predict.py
+================================================================================
+
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+from pathlib import Path
+
+LAUNCH_DIR = Path.cwd()
+
+import numpy as np
+import polars as pl
+
+from ckan_specnet.core import Config, EVAL_NAME_COL, configure_torch_runtime, device_of
+from ckan_specnet.data import frame_to_xy
+from ckan_specnet.eval import (
+    load_manifest,
+    predict_saved_ensemble_streaming,
+    tasks_from_manifest,
+)
+from ckan_specnet.paths import PredictPaths
+from ckan_specnet.plot import class_meaning
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run single-sample prediction with released CKAN-SpecNet models."
+    )
+    parser.add_argument("--test", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--eval-name", type=str, required=True)
+    parser.add_argument("--sample-index", type=int, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    paths = PredictPaths.from_args(args, LAUNCH_DIR)
+
+    configure_torch_runtime()
+
+    manifest = load_manifest(paths.run_dir)
+    tasks = tasks_from_manifest(manifest)
+
+    test_df = pl.read_parquet(paths.test)
+    subset = test_df.filter(pl.col(EVAL_NAME_COL) == args.eval_name)
+
+    if subset.height == 0:
+        raise ValueError(f"Empty eval subset: {args.eval_name}")
+
+    if not 0 <= args.sample_index < subset.height:
+        raise IndexError(
+            f"sample-index={args.sample_index} out of range for "
+            f"{args.eval_name} with {subset.height} samples."
+        )
+
+    x, y, _ = frame_to_xy(subset.slice(args.sample_index, 1), tasks)
+
+    cfg = replace(
+        Config(),
+        test_parquet=paths.test,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+
+    pred_result = predict_saved_ensemble_streaming(
+        run_dir=paths.run_dir,
+        manifest=manifest,
+        x=x,
+        tasks=tasks,
+        cfg=cfg,
+        device=device_of(),
+    )
+
+    rows = []
+
+    for task in tasks.all:
+        prob = pred_result["prob"][task][0]
+        pred_class = int(np.argmax(prob))
+        true_class = int(y[task][0])
+
+        rows.append(
+            {
+                "task": task,
+                "n_classes": tasks.num_classes[task],
+                "true_class": true_class,
+                "true_label": class_meaning(task, true_class),
+                "pred_class": pred_class,
+                "pred_label": class_meaning(task, pred_class),
+                "probability": float(prob[pred_class]),
+                "correct": pred_class == true_class,
+            }
+        )
+
+    paths.out.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(rows).write_csv(paths.out)
+    print(f"Saved prediction: {paths.out}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+File: ./scripts/digitize.py
+================================================================================
+
+from __future__ import annotations
+
+import argparse
+import re
+from dataclasses import dataclass, replace
+from functools import cache
+from pathlib import Path
+from typing import Literal
+
+import cv2
+import imageio.v3 as iio
+import numpy as np
+import polars as pl
+from doctr.models import ocr_predictor
+
+
+Axis = Literal["x", "y"]
+Curve = dict[str, np.ndarray]
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+
+
+@dataclass(frozen=True)
+class Config:
+    crop_inset: int = 3
+    bin_threshold: int = 220
+    ink_gray_threshold: int = 238
+    ink_energy_threshold: float = 0.06
+
+    stroke_width_min: float = 1.0
+    stroke_width_max: float = 18.0
+    stroke_radius_factor: float = 0.50
+
+    c_max: int = 20
+    max_candidates_normal: int = 7
+    max_candidates_event: int = 20
+    candidate_quantiles: tuple[float, ...] = (0.12, 0.25, 0.38, 0.50, 0.62, 0.75, 0.88)
+
+    event_height_factor: float = 2.2
+    event_gradient_factor: float = 2.3
+    event_depression_factor: float = 1.2
+    event_dilate_factor: float = 2.8
+
+    point_center_penalty: float = 0.012
+    point_white_penalty: float = 0.45
+    point_dark_reward: float = 1.10
+    point_ridge_reward: float = 0.45
+    bridge_point_penalty: float = 4.5
+
+    envelope_miss_weight: float = 9.2
+    off_ink_weight: float = 0.72
+    edge_ridge_reward: float = 0.42
+    edge_energy_reward: float = 0.018
+    length_weight: float = 0.004
+
+    slope_weight: float = 0.018
+    acceleration_weight: float = 0.085
+    nonlinear_knee: float = 5.0
+    support_relief: float = 0.92
+    event_support_floor: float = 0.75
+    max_abs_slope: float = 540.0
+
+    snap_final: bool = True
+    snap_radius_factor: float = 1.20
+    snap_distance_weight: float = 0.85
+    snap_energy_weight: float = 0.018
+    snap_ridge_weight: float = 1.55
+
+    ocr_min_conf: float = 0.12
+    x_value_bounds: tuple[float, float] = (150.0, 5200.0)
+    output_points: int = 1800
+
+    fallback_x_start: float = 4000.0
+    fallback_x_end: float = 500.0
+    fallback_y_min: float = 0.0
+    fallback_y_max: float = 100.0
+
+
+@dataclass(frozen=True)
+class Box:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+    def clamp(self, w: int, h: int) -> Box:
+        left = max(0, min(self.left, w - 2))
+        top = max(0, min(self.top, h - 2))
+        right = max(left + 1, min(self.right, w - 1))
+        bottom = max(top + 1, min(self.bottom, h - 1))
+        return Box(left, top, right, bottom)
+
+
+@dataclass(frozen=True)
+class LinearAxisFit:
+    slope: float
+    intercept: float
+    rmse: float
+    count: int
+    source: str = "linear"
+
+    def value_at(self, pixel):
+        return self.slope * np.asarray(pixel, dtype=float) + self.intercept
+
+    def pixel_at(self, value: float) -> float:
+        return float((value - self.intercept) / self.slope)
+
+
+@dataclass(frozen=True)
+class PiecewiseAxisFit:
+    pixels: np.ndarray
+    values: np.ndarray
+    rmse: float
+    count: int
+    source: str = "piecewise"
+
+    def value_at(self, pixel):
+        x = np.asarray(pixel, dtype=float)
+        scalar = x.ndim == 0
+        x = np.atleast_1d(x)
+
+        order = np.argsort(self.pixels)
+        px = self.pixels[order].astype(float)
+        val = self.values[order].astype(float)
+
+        y = np.interp(x, px, val)
+
+        if len(px) >= 2:
+            left = x < px[0]
+            if np.any(left):
+                slope = (val[1] - val[0]) / (px[1] - px[0])
+                y[left] = val[0] + slope * (x[left] - px[0])
+
+            right = x > px[-1]
+            if np.any(right):
+                slope = (val[-1] - val[-2]) / (px[-1] - px[-2])
+                y[right] = val[-1] + slope * (x[right] - px[-1])
+
+        return float(y[0]) if scalar else y
+
+    def pixel_at(self, value: float) -> float:
+        order = np.argsort(self.values)
+        val = self.values[order].astype(float)
+        px = self.pixels[order].astype(float)
+
+        if len(val) == 1:
+            return float(px[0])
+
+        if value < val[0]:
+            slope = (px[1] - px[0]) / (val[1] - val[0])
+            return float(px[0] + slope * (value - val[0]))
+
+        if value > val[-1]:
+            slope = (px[-1] - px[-2]) / (val[-1] - val[-2])
+            return float(px[-1] + slope * (value - val[-1]))
+
+        return float(np.interp(value, val, px))
+
+
+@dataclass(frozen=True)
+class OcrWord:
+    text: str
+    conf: float
+    left: float
+    top: float
+    right: float
+    bottom: float
+    cx: float
+    cy: float
+
+
+@dataclass(frozen=True)
+class AxisLabel:
+    text: str
+    axis_value: float
+    tick_pixel: float
+    left: float
+    top: float
+    right: float
+    bottom: float
+    conf: float
+    inlier: bool = True
+
+
+def gray(image: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+
+def normalize_u8(values: np.ndarray, lo_q: float = 1, hi_q: float = 99.5) -> np.ndarray:
+    values = values.astype(np.float32)
+    lo, hi = np.nanpercentile(values, [lo_q, hi_q])
+
+    if hi <= lo:
+        return np.zeros(values.shape, np.uint8)
+
+    return np.clip((values - lo) * 255.0 / (hi - lo), 0, 255).astype(np.uint8)
+
+
+def save_rgb(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+
+def read_gif(path: Path) -> np.ndarray:
+    image = iio.imread(path)
+
+    if image.ndim == 4:
+        image = image[0]
+
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+
+    return image.astype(np.uint8)
+
+
+def read_image(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".gif":
+        return read_gif(path)
+
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError(f"cannot read image: {path.resolve()}")
+
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def validate_input(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"input file does not exist: {path}")
+
+    if not path.is_file():
+        raise ValueError(f"input must be a file: {path}")
+
+    if path.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+        raise ValueError(f"unsupported image format: {path.suffix}; supported: {supported}")
+
+
+def threshold_dark(image: np.ndarray, threshold: int) -> np.ndarray:
+    _, mask = cv2.threshold(gray(image), threshold, 255, cv2.THRESH_BINARY_INV)
+    return mask
+
+
+def line_segments(mask: np.ndarray):
+    h, w = mask.shape
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, w // 8), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(40, h // 8)))
+
+    hm = cv2.morphologyEx(mask, cv2.MORPH_OPEN, h_kernel)
+    vm = cv2.morphologyEx(mask, cv2.MORPH_OPEN, v_kernel)
+
+    h_segments = []
+    v_segments = []
+
+    for y in np.flatnonzero(np.count_nonzero(hm > 0, axis=1)):
+        xs = np.flatnonzero(hm[y] > 0)
+
+        for run in np.split(xs, np.where(np.diff(xs) > 4)[0] + 1):
+            if len(run) >= w * 0.15:
+                h_segments.append(
+                    {
+                        "x1": int(run[0]),
+                        "x2": int(run[-1]),
+                        "y": int(y),
+                        "length": int(len(run)),
+                    }
+                )
+
+    for x in np.flatnonzero(np.count_nonzero(vm > 0, axis=0)):
+        ys = np.flatnonzero(vm[:, x] > 0)
+
+        for run in np.split(ys, np.where(np.diff(ys) > 4)[0] + 1):
+            if len(run) >= h * 0.10:
+                v_segments.append(
+                    {
+                        "x": int(x),
+                        "y1": int(run[0]),
+                        "y2": int(run[-1]),
+                        "length": int(len(run)),
+                    }
+                )
+
+    return h_segments, v_segments
+
+
+def detect_plot_box(image: np.ndarray, cfg: Config) -> tuple[Box, str]:
+    mask = threshold_dark(image, cfg.bin_threshold)
+    h, w = mask.shape
+    h_segments, v_segments = line_segments(mask)
+    candidates = []
+
+    for bottom in h_segments:
+        if not (h * 0.25 <= bottom["y"] <= h * 0.94):
+            continue
+        if bottom["length"] < w * 0.30:
+            continue
+
+        for left in v_segments:
+            if left["x"] > w * 0.40:
+                continue
+            if abs(left["y2"] - bottom["y"]) > max(22, h * 0.025):
+                continue
+            if left["length"] < h * 0.12:
+                continue
+
+            right = bottom["x2"]
+            top_candidates = [
+                seg
+                for seg in h_segments
+                if abs(seg["x1"] - left["x"]) <= max(45, w * 0.025)
+                and abs(seg["x2"] - right) <= max(110, w * 0.055)
+                and h * 0.04 <= seg["y"] < bottom["y"] - h * 0.10
+                and seg["length"] >= w * 0.25
+            ]
+
+            top = max([seg["y"] for seg in top_candidates], default=left["y1"])
+            box = Box(left["x"], top, right, bottom["y"]).clamp(w, h)
+
+            if box.width >= w * 0.25 and box.height >= h * 0.10:
+                score = box.width * box.height + bottom["length"] * 10 + left["length"] * 10
+                candidates.append((score, box))
+
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1], "axis_or_box"
+
+    return Box(int(w * 0.08), int(h * 0.12), int(w * 0.95), int(h * 0.75)).clamp(w, h), "fallback"
+
+
+def crop_plot(image: np.ndarray, box: Box, cfg: Config) -> np.ndarray:
+    inset = cfg.crop_inset
+    return image[box.top + inset:box.bottom - inset, box.left + inset:box.right - inset]
+
+
+def border_axis_mask(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    out = np.zeros_like(mask)
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(70, w // 3), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(70, h // 3)))
+
+    hm = cv2.morphologyEx(mask, cv2.MORPH_OPEN, h_kernel)
+    vm = cv2.morphologyEx(mask, cv2.MORPH_OPEN, v_kernel)
+
+    rows = np.count_nonzero(hm > 0, axis=1)
+    cols = np.count_nonzero(vm > 0, axis=0)
+
+    for y in np.flatnonzero(rows > w * 0.70):
+        if y < h * 0.12 or y > h * 0.86:
+            out[max(0, y - 1):min(h, y + 2), :] = hm[max(0, y - 1):min(h, y + 2), :]
+
+    for x in np.flatnonzero(cols > h * 0.55):
+        if x < w * 0.08 or x > w * 0.96:
+            out[:, max(0, x - 1):min(w, x + 2)] = vm[:, max(0, x - 1):min(w, x + 2)]
+
+    return cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
+
+
+def ink_energy_from_gray(g: np.ndarray) -> np.ndarray:
+    g = g.astype(np.float32)
+    border = np.r_[g[:5, :].ravel(), g[-5:, :].ravel(), g[:, :5].ravel(), g[:, -5:].ravel()]
+    return np.maximum(0, float(np.median(border)) - g)
+
+
+def ink_mask_from_gray(g: np.ndarray, energy: np.ndarray, cfg: Config) -> np.ndarray:
+    e = normalize_u8(energy)
+    mask = ((g <= cfg.ink_gray_threshold) | (e >= int(cfg.ink_energy_threshold * 255))).astype(np.uint8) * 255
+
+    mask[border_axis_mask(mask) > 0] = 0
+
+    mask[:2, :] = 0
+    mask[-2:, :] = 0
+    mask[:, :2] = 0
+    mask[:, -2:] = 0
+
+    return mask
+
+
+def estimate_stroke_width(mask: np.ndarray, cfg: Config) -> float:
+    binary = (mask > 0).astype(np.uint8)
+
+    if cv2.countNonZero(binary) == 0:
+        return 2.0
+
+    values = cv2.distanceTransform(binary, cv2.DIST_L2, 3)[binary > 0]
+
+    if len(values) == 0:
+        return 2.0
+
+    return float(np.clip(2.0 * np.percentile(values, 82), cfg.stroke_width_min, cfg.stroke_width_max))
+
+
+def split_runs(indices: np.ndarray) -> list[np.ndarray]:
+    if len(indices) == 0:
+        return []
+
+    return np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+
+
+def column_runs(mask: np.ndarray) -> dict[int, list[dict]]:
+    out = {}
+
+    for x in range(mask.shape[1]):
+        runs = []
+
+        for run_id, run in enumerate(split_runs(np.flatnonzero(mask[:, x] > 0))):
+            top = float(run.min())
+            bottom = float(run.max())
+
+            runs.append(
+                {
+                    "x": int(x),
+                    "run_id": int(run_id),
+                    "top": top,
+                    "bottom": bottom,
+                    "center": 0.5 * (top + bottom),
+                    "height": bottom - top + 1.0,
+                    "ys": run.astype(int),
+                }
+            )
+
+        if runs:
+            out[x] = runs
+
+    return out
+
+
+def interpolate_nan(values: np.ndarray) -> np.ndarray:
+    x = np.arange(len(values))
+    ok = np.isfinite(values)
+
+    if ok.sum() == 0:
+        return np.zeros_like(values, dtype=float)
+
+    if ok.sum() == 1:
+        return np.full_like(values, float(values[ok][0]), dtype=float)
+
+    return np.interp(x, x[ok], values[ok])
+
+
+def rolling_median(values: np.ndarray, window: int) -> np.ndarray:
+    window = max(3, int(window) | 1)
+    pad = window // 2
+    padded = np.pad(values.astype(np.float64), pad, mode="edge")
+    return np.median(np.lib.stride_tricks.sliding_window_view(padded, window), axis=1)
+
+
+def prepare_fields(mask: np.ndarray, energy: np.ndarray, stroke_width: float) -> dict:
+    _, w = mask.shape
+    runs_by_x = column_runs(mask)
+
+    top = np.full(w, np.nan, dtype=float)
+    bottom = np.full(w, np.nan, dtype=float)
+    center = np.full(w, np.nan, dtype=float)
+    height = np.zeros(w, dtype=float)
+    weighted_center = np.full(w, np.nan, dtype=float)
+    ridge_y = np.full(w, np.nan, dtype=float)
+    energy_y = np.full(w, np.nan, dtype=float)
+
+    ridge = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3).astype(float)
+
+    if ridge.max() > 0:
+        ridge /= float(ridge.max())
+
+    for x, runs in runs_by_x.items():
+        ys_all = np.flatnonzero(mask[:, x] > 0)
+
+        top[x] = float(ys_all.min())
+        bottom[x] = float(ys_all.max())
+        center[x] = 0.5 * (top[x] + bottom[x])
+        height[x] = bottom[x] - top[x] + 1.0
+
+        run = max(runs, key=lambda item: item["height"])
+        ys = run["ys"]
+        weights = np.maximum(energy[ys, x].astype(float), 1.0)
+
+        weighted_center[x] = float(np.sum(ys * weights) / np.sum(weights))
+        ridge_y[x] = float(ys[int(np.argmax(ridge[ys, x]))])
+        energy_y[x] = float(ys[int(np.argmax(energy[ys, x]))])
+
+    top_i = interpolate_nan(top)
+    bottom_i = interpolate_nan(bottom)
+    baseline = rolling_median(top_i, max(9, int(round(18 * stroke_width)) | 1))
+
+    return {
+        "runs_by_x": runs_by_x,
+        "top": top_i.astype(np.float32),
+        "bottom": bottom_i.astype(np.float32),
+        "center": interpolate_nan(center).astype(np.float32),
+        "weighted_center": interpolate_nan(weighted_center).astype(np.float32),
+        "ridge_y": interpolate_nan(ridge_y).astype(np.float32),
+        "energy_y": interpolate_nan(energy_y).astype(np.float32),
+        "height": height.astype(np.float32),
+        "local_height": rolling_median(height, max(7, int(round(6 * stroke_width)) | 1)).astype(np.float32),
+        "dist_to_ink": cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32),
+        "ridge": ridge.astype(np.float32),
+        "baseline": baseline.astype(np.float32),
+        "depression": np.maximum(0.0, bottom_i - baseline).astype(np.float32),
+        "gradient": np.abs(np.gradient(bottom_i)).astype(np.float32),
+    }
+
+
+def event_mask(fields: dict, stroke_width: float, cfg: Config) -> np.ndarray:
+    event = fields["gradient"] >= max(2.0, cfg.event_gradient_factor * stroke_width)
+    event |= fields["height"] >= np.maximum(
+        cfg.event_height_factor * stroke_width,
+        1.35 * np.maximum(fields["local_height"], 1.0),
+    )
+    event |= fields["depression"] >= max(1.0, cfg.event_depression_factor * stroke_width)
+
+    k = max(3, int(round(cfg.event_dilate_factor * stroke_width)) | 1)
+
+    return cv2.morphologyEx(
+        event.astype(np.uint8)[None, :] * 255,
+        cv2.MORPH_CLOSE,
+        np.ones((1, k), np.uint8),
+    )[0] > 0
+
+
+def candidate_cost(
+    y: float,
+    x: int,
+    run_center: float,
+    crop_gray: np.ndarray,
+    energy: np.ndarray,
+    fields: dict,
+    stroke_width: float,
+    energy_scale: float,
+    cfg: Config,
+) -> float:
+    yy = int(np.clip(round(y), 0, crop_gray.shape[0] - 1))
+    center_penalty = abs(float(y) - run_center) / max(1.0, stroke_width)
+    white_penalty = np.clip((float(crop_gray[yy, x]) - 210.0) / 45.0, 0.0, 1.0)
+    dark = float(energy[yy, x]) / energy_scale
+    ridge = float(fields["ridge"][yy, x])
+
+    return float(
+        cfg.point_center_penalty * center_penalty
+        + cfg.point_white_penalty * white_penalty
+        - cfg.point_dark_reward * min(1.0, dark)
+        - cfg.point_ridge_reward * ridge
+    )
+
+
+def dedup_candidates(items: list[dict], limit: int, stroke_width: float) -> list[dict]:
+    ordered = sorted(items, key=lambda item: item["cost"])
+    radius = max(0.45, 0.45 * stroke_width)
+    kept = []
+
+    for item in ordered:
+        if all(abs(item["y"] - old["y"]) > radius for old in kept):
+            kept.append(item)
+
+        if len(kept) >= limit:
+            break
+
+    return sorted(kept, key=lambda item: item["y"])
+
+
+def build_candidates(
+    crop_gray: np.ndarray,
+    mask: np.ndarray,
+    energy: np.ndarray,
+    fields: dict,
+    stroke_width: float,
+    cfg: Config,
+):
+    h, w = mask.shape
+    events = event_mask(fields, stroke_width, cfg)
+    energy_scale = max(1.0, float(np.percentile(energy[energy > 0], 95)) if np.any(energy > 0) else 1.0)
+    layers = []
+
+    for x in range(w):
+        runs = fields["runs_by_x"].get(x)
+        items = []
+        limit = cfg.max_candidates_event if events[x] else cfg.max_candidates_normal
+
+        if runs:
+            for run in runs:
+                ys = run["ys"]
+                center = float(run["center"])
+
+                values = [
+                    int(round(run["top"])),
+                    int(round(run["bottom"])),
+                    int(round(center)),
+                    int(round(fields["weighted_center"][x])),
+                    int(round(fields["ridge_y"][x])),
+                    int(round(fields["energy_y"][x])),
+                ]
+
+                if events[x] and len(ys) > 2:
+                    values.extend(np.quantile(ys, cfg.candidate_quantiles).round().astype(int).tolist())
+
+                for y in sorted(set(int(np.clip(value, 0, h - 1)) for value in values)):
+                    items.append(
+                        {
+                            "x": int(x),
+                            "y": float(y),
+                            "cost": candidate_cost(
+                                y,
+                                x,
+                                center,
+                                crop_gray,
+                                energy,
+                                fields,
+                                stroke_width,
+                                energy_scale,
+                                cfg,
+                            ),
+                            "is_event": bool(events[x]),
+                        }
+                    )
+        else:
+            y0 = int(np.clip(round(fields["weighted_center"][x]), 0, h - 1))
+            radius = max(2, int(round(2.5 * stroke_width)))
+            step = max(1, int(round(stroke_width)))
+
+            for dy in range(-radius, radius + 1, step):
+                y = int(np.clip(y0 + dy, 0, h - 1))
+                items.append(
+                    {
+                        "x": int(x),
+                        "y": float(y),
+                        "cost": float(cfg.bridge_point_penalty + 0.05 * abs(dy)),
+                        "is_event": bool(events[x]),
+                    }
+                )
+
+        layers.append(dedup_candidates(items, limit, stroke_width))
+
+    return layers, events
+
+
+def pack_layers_to_arrays(layers: list[list[dict]], cfg: Config):
+    w, c = len(layers), cfg.c_max
+
+    y = np.zeros((w, c), dtype=np.float32)
+    point_cost = np.full((w, c), np.inf, dtype=np.float32)
+    valid = np.zeros((w, c), dtype=bool)
+    is_event = np.zeros((w, c), dtype=bool)
+
+    for x, layer in enumerate(layers):
+        for k, item in enumerate(sorted(layer, key=lambda item: item["cost"])[:c]):
+            y[x, k] = float(item["y"])
+            point_cost[x, k] = float(item["cost"])
+            valid[x, k] = True
+            is_event[x, k] = bool(item.get("is_event", False))
+
+    return {
+        "y": y,
+        "point_cost": point_cost,
+        "valid": valid,
+        "is_event": is_event,
+    }
+
+
+def nonlinear_abs_np(values: np.ndarray, knee: float) -> np.ndarray:
+    values = np.abs(values).astype(np.float32)
+    excess = np.maximum(values - knee, 0.0)
+    return np.where(values <= knee, values, knee + np.log1p(excess)).astype(np.float32)
+
+
+def precompute_edges_numpy(packed: dict, fields: dict, energy: np.ndarray, stroke_width: float, cfg: Config):
+    y = packed["y"]
+    valid = packed["valid"]
+
+    w, c = y.shape
+    h = fields["dist_to_ink"].shape[0]
+
+    edge_cost = np.full((w, c, c), np.inf, dtype=np.float32)
+    edge_support = np.zeros((w, c, c), dtype=np.float32)
+    slope = np.zeros((w, c, c), dtype=np.float32)
+
+    stroke_radius = max(0.5, cfg.stroke_radius_factor * stroke_width)
+    top = fields["top"]
+    bottom = fields["bottom"]
+    height = fields["height"]
+    local_height = fields["local_height"]
+    dist = fields["dist_to_ink"]
+    ridge = fields["ridge"]
+
+    energy_scale = max(1.0, float(np.percentile(energy[energy > 0], 95)) if np.any(energy > 0) else 1.0)
+
+    for x in range(1, w):
+        valid_edge = valid[x - 1, :, None] & valid[x, None, :]
+        y0 = y[x - 1, :, None]
+        y1 = y[x, None, :]
+        dy = y1 - y0
+        slope[x] = dy.astype(np.float32)
+
+        if height[x - 1] <= 0 and height[x] <= 0:
+            env_cost = np.zeros((c, c), dtype=np.float32)
+            coverage = np.ones((c, c), dtype=np.float32)
+        else:
+            slab_top = min(float(top[x - 1]), float(top[x]))
+            slab_bottom = max(float(bottom[x - 1]), float(bottom[x]))
+            slab_height = max(1.0, slab_bottom - slab_top + 1.0)
+
+            seg_min = np.minimum(y0, y1) - stroke_radius
+            seg_max = np.maximum(y0, y1) + stroke_radius
+
+            miss = np.maximum(0.0, seg_min - slab_top) + np.maximum(0.0, slab_bottom - seg_max)
+            coverage = 1.0 - np.minimum(1.0, miss / slab_height)
+
+            tallness = slab_height / max(1.0, stroke_width)
+            local_ratio = slab_height / max(1.0, float(max(local_height[x - 1], local_height[x], stroke_width)))
+
+            weight = 1.0
+
+            if tallness >= 2.0:
+                weight += min(6.0, 0.95 * tallness)
+
+            if local_ratio >= 1.25:
+                weight += min(4.5, local_ratio)
+
+            env_cost = cfg.envelope_miss_weight * weight * (miss / max(1.0, stroke_width)) ** 1.45
+
+        yi0 = np.clip(np.rint(y0[:, 0]).astype(np.int32), 0, h - 1)
+        yi1 = np.clip(np.rint(y1[0, :]).astype(np.int32), 0, h - 1)
+        yim = np.clip(np.rint(0.5 * (y0 + y1)).astype(np.int32), 0, h - 1)
+
+        off = 0.25 * dist[yi0, x - 1][:, None] + 0.50 * dist[yim, x] + 0.25 * dist[yi1, x][None, :]
+
+        ridge_score = (
+            0.25 * ridge[yi0, x - 1][:, None]
+            + 0.50 * ridge[yim, x]
+            + 0.25 * ridge[yi1, x][None, :]
+        )
+
+        energy_score = (
+            0.25 * energy[yi0, x - 1][:, None]
+            + 0.50 * energy[yim, x]
+            + 0.25 * energy[yi1, x][None, :]
+        ) / energy_scale
+
+        cost = (
+            env_cost
+            + cfg.off_ink_weight * off
+            + cfg.length_weight * np.hypot(1.0, dy)
+            - cfg.edge_ridge_reward * ridge_score
+            - cfg.edge_energy_reward * energy_score
+        )
+
+        edge_cost[x] = np.where((np.abs(dy) <= cfg.max_abs_slope) & valid_edge, cost, np.inf).astype(np.float32)
+        edge_support[x] = np.clip(np.maximum(coverage, ridge_score), 0.0, 1.0).astype(np.float32)
+
+    return {
+        "edge_cost": edge_cost,
+        "edge_support": edge_support,
+        "slope": slope,
+    }
+
+
+def solve_second_order_viterbi_numpy(packed: dict, edges: dict, cfg: Config) -> Curve:
+    y = packed["y"]
+    point_cost = packed["point_cost"]
+    valid = packed["valid"]
+    is_event = packed["is_event"]
+
+    edge_cost = edges["edge_cost"]
+    edge_support = edges["edge_support"]
+    slope = edges["slope"]
+
+    w, c = y.shape
+
+    if w == 0:
+        return {
+            "px": np.array([], dtype=np.float64),
+            "py": np.array([], dtype=np.float64),
+            "steep": np.array([], dtype=bool),
+        }
+
+    if w == 1:
+        k = int(np.nanargmin(point_cost[0]))
+        return {
+            "px": np.array([0.0], dtype=np.float64),
+            "py": np.array([float(y[0, k])], dtype=np.float64),
+            "steep": np.array([bool(is_event[0, k])], dtype=bool),
+        }
+
+    init_valid = valid[0, :, None] & valid[1, None, :]
+    support = edge_support[1]
+
+    dp = (
+        point_cost[0, :, None]
+        + point_cost[1, None, :]
+        + edge_cost[1]
+        + cfg.slope_weight * (1.0 - cfg.support_relief * support) * nonlinear_abs_np(slope[1], cfg.nonlinear_knee)
+    ).astype(np.float32)
+
+    dp = np.where(init_valid, dp, np.inf).astype(np.float32)
+    parents = np.full((w, c, c), -1, dtype=np.int16)
+
+    for x in range(2, w):
+        prev_slope = slope[x - 1][:, :, None]
+        cur_slope = slope[x][None, :, :]
+
+        support = edge_support[x][None, :, :]
+        support = np.where(
+            is_event[x - 1, None, :, None] | is_event[x, None, None, :],
+            np.maximum(support, cfg.event_support_floor),
+            support,
+        )
+
+        transition = (
+            dp[:, :, None]
+            + edge_cost[x][None, :, :]
+            + point_cost[x, None, None, :]
+            + cfg.slope_weight * (1.0 - cfg.support_relief * support) * nonlinear_abs_np(cur_slope, cfg.nonlinear_knee)
+            + cfg.acceleration_weight
+            * (1.0 - 0.70 * support)
+            * nonlinear_abs_np(cur_slope - prev_slope, cfg.nonlinear_knee)
+        )
+
+        invalid = ~(valid[x - 2, :, None, None] & valid[x - 1, None, :, None] & valid[x, None, None, :])
+        transition = np.where(invalid, np.inf, transition)
+
+        parent_i = np.argmin(transition, axis=0).astype(np.int16)
+        new_dp = np.min(transition, axis=0).astype(np.float32)
+
+        if not np.isfinite(new_dp).any():
+            best_j, best_k = np.unravel_index(np.nanargmin(dp), dp.shape)
+            new_dp = np.full((c, c), np.inf, dtype=np.float32)
+
+            for k in np.flatnonzero(valid[x]):
+                new_dp[best_k, k] = dp[best_j, best_k] + point_cost[x, k] + 25.0
+                parent_i[best_k, k] = best_j
+
+        parents[x] = parent_i
+        dp = new_dp
+
+    j, k = np.unravel_index(np.nanargmin(dp), dp.shape)
+
+    path = np.zeros(w, dtype=np.int16)
+    path[w - 1] = k
+    path[w - 2] = j
+
+    for x in range(w - 1, 1, -1):
+        i = parents[x, path[x - 1], path[x]]
+        path[x - 2] = i if i >= 0 else int(np.nanargmin(point_cost[x - 2]))
+
+    idx = np.arange(w)
+
+    return {
+        "px": idx.astype(np.float64),
+        "py": y[idx, path].astype(np.float64),
+        "steep": is_event[idx, path].astype(bool),
+    }
+
+
+def snap_curve(curve: Curve, mask: np.ndarray, energy: np.ndarray, fields: dict, stroke_width: float, cfg: Config) -> Curve:
+    if not cfg.snap_final or len(curve["px"]) == 0:
+        return curve
+
+    _, w = mask.shape
+    ridge = fields["ridge"]
+    radius = max(1, int(round(cfg.snap_radius_factor * stroke_width)))
+
+    py = curve["py"].copy()
+
+    for x in range(w):
+        ys = np.flatnonzero(mask[:, x] > 0)
+
+        if len(ys) == 0:
+            continue
+
+        near = ys[np.abs(ys.astype(float) - py[x]) <= radius]
+
+        if len(near) == 0:
+            continue
+
+        score = (
+            cfg.snap_distance_weight * np.abs(near.astype(float) - py[x]) / max(1.0, stroke_width)
+            - cfg.snap_energy_weight * energy[near, x].astype(float)
+            - cfg.snap_ridge_weight * ridge[near, x].astype(float)
+        )
+
+        py[x] = float(near[int(np.argmin(score))])
+
+    return {**curve, "py": py}
+
+
+def path_abs(curve: Curve, box: Box, cfg: Config) -> Curve:
+    return {
+        **curve,
+        "px_abs": curve["px"] + box.left + cfg.crop_inset,
+        "py_abs": curve["py"] + box.top + cfg.crop_inset,
+    }
+
+
+def extract_curve(image: np.ndarray, box: Box, cfg: Config) -> dict:
+    crop = crop_plot(image, box, cfg)
+    crop_gray = gray(crop)
+    energy = ink_energy_from_gray(crop_gray)
+    mask = ink_mask_from_gray(crop_gray, energy, cfg)
+    stroke_width = estimate_stroke_width(mask, cfg)
+    fields = prepare_fields(mask, energy, stroke_width)
+
+    layers, _ = build_candidates(crop_gray, mask, energy, fields, stroke_width, cfg)
+    packed = pack_layers_to_arrays(layers, cfg)
+    edges = precompute_edges_numpy(packed, fields, energy, stroke_width, cfg)
+
+    curve = solve_second_order_viterbi_numpy(packed, edges, cfg)
+    curve = snap_curve(curve, mask, energy, fields, stroke_width, cfg)
+
+    return {
+        "stroke_width": stroke_width,
+        "curve": curve,
+        "curve_abs": path_abs(curve, box, cfg),
+    }
+
+
+@cache
+def doctr_model():
+    return ocr_predictor(pretrained=True, assume_straight_pages=True)
+
+
+class DoctrOcr:
+    def __call__(self, image: np.ndarray) -> list[OcrWord]:
+        result = doctr_model()([image])
+        h, w = image.shape[:2]
+        words = []
+
+        for block in result.pages[0].blocks:
+            for line in block.lines:
+                for word in line.words:
+                    (x0, y0), (x1, y1) = word.geometry
+                    left, top, right, bottom = x0 * w, y0 * h, x1 * w, y1 * h
+
+                    words.append(
+                        OcrWord(
+                            text=str(word.value),
+                            conf=float(word.confidence),
+                            left=float(left),
+                            top=float(top),
+                            right=float(right),
+                            bottom=float(bottom),
+                            cx=float((left + right) / 2),
+                            cy=float((top + bottom) / 2),
+                        )
+                    )
+
+        return words
+
+
+def axis_token(text: str) -> str | None:
+    raw = str(text).strip()
+
+    if not raw:
+        return None
+
+    allowed = set("0123456789LIl|OoDDSs+-−– ")
+
+    if any(ch not in allowed for ch in raw):
+        return None
+
+    token = raw.translate(
+        str.maketrans(
+            {
+                "L": "1",
+                "I": "1",
+                "l": "1",
+                "|": "1",
+                "O": "0",
+                "o": "0",
+                "D": "0",
+                "S": "5",
+                "s": "5",
+                "+": "",
+                "-": "",
+                "−": "",
+                "–": "",
+                " ": "",
+            }
+        )
+    )
+
+    return token if re.fullmatch(r"\d+", token) else None
+
+
+def x_candidates(text: str, cfg: Config) -> list[float]:
+    token = axis_token(text)
+
+    if token is None:
+        return []
+
+    value = float(token)
+    lo, hi = cfg.x_value_bounds
+
+    return [value] if lo <= value <= hi else []
+
+
+def y_candidates(text: str) -> list[float]:
+    raw = str(text).strip().upper()
+
+    if raw in {"LOD", "LOO", "L00", "I00", "IOO"}:
+        return [100.0]
+
+    token = axis_token(text)
+
+    if token is None:
+        return []
+
+    value = float(token)
+    legal = set(range(0, 101, 10)) | {5, 6}
+
+    if value in legal:
+        return [value]
+
+    if len(token) >= 3:
+        return []
+
+    values = set()
+
+    for end in range(1, len(token)):
+        value = float(token[:end])
+
+        if value in legal:
+            values.add(value)
+
+    return sorted(values)
+
+
+def tick_ocr(ocr: list[OcrWord], axis: Axis, cfg: Config) -> list[tuple[OcrWord, list[float]]]:
+    out = []
+
+    for word in ocr:
+        if word.conf < cfg.ocr_min_conf:
+            continue
+
+        values = x_candidates(word.text, cfg) if axis == "x" else y_candidates(word.text)
+
+        if values:
+            out.append((word, values))
+
+    return out
+
+
+def group_items(items: list, key, tol: float) -> list[list]:
+    groups: list[list] = []
+
+    for item in sorted(items, key=key):
+        value = key(item)
+
+        for group in groups:
+            center = float(np.median([key(x) for x in group]))
+
+            if abs(value - center) <= tol:
+                group.append(item)
+                break
+        else:
+            groups.append([item])
+
+    return groups
+
+
+def clean_labels(labels: list[AxisLabel]) -> list[AxisLabel]:
+    return [label for label in labels if label.inlier]
+
+
+def fallback_x(box: Box, cfg: Config) -> LinearAxisFit:
+    slope = (cfg.fallback_x_end - cfg.fallback_x_start) / max(1, box.width)
+
+    return LinearAxisFit(
+        float(slope),
+        float(cfg.fallback_x_start - slope * box.left),
+        float("nan"),
+        2,
+        "box_fallback",
+    )
+
+
+def fallback_y(box: Box, cfg: Config) -> LinearAxisFit:
+    slope = (cfg.fallback_y_min - cfg.fallback_y_max) / max(1, box.height)
+
+    return LinearAxisFit(
+        float(slope),
+        float(cfg.fallback_y_max - slope * box.top),
+        float("nan"),
+        2,
+        "box_fallback",
+    )
+
+
+def fit_x(labels: list[AxisLabel]) -> PiecewiseAxisFit | None:
+    clean = clean_labels(labels)
+
+    if len(clean) < 3:
+        return None
+
+    return PiecewiseAxisFit(
+        pixels=np.array([label.tick_pixel for label in clean], dtype=float),
+        values=np.array([label.axis_value for label in clean], dtype=float),
+        rmse=0.0,
+        count=len(clean),
+        source="doctr_axis_region_piecewise",
+    )
+
+
+def fit_y_stable(labels: list[AxisLabel], box: Box, cfg: Config) -> LinearAxisFit:
+    clean = [
+        label
+        for label in clean_labels(labels)
+        if 0 <= label.axis_value <= 90 and not np.isclose(label.axis_value, 100.0)
+    ]
+
+    preferred_values = {90, 80, 70, 60, 50, 40, 30, 20, 10}
+    preferred = [label for label in clean if label.axis_value in preferred_values]
+
+    if len(preferred) >= 2:
+        clean = preferred
+
+    if len(clean) < 2:
+        return fallback_y(box, cfg)
+
+    clean = sorted(clean, key=lambda item: item.axis_value, reverse=True)
+
+    value = np.array([label.axis_value for label in clean], dtype=float)
+    pixel = np.array([label.tick_pixel for label in clean], dtype=float)
+
+    slope, intercept = np.polyfit(pixel, value, 1)
+
+    if slope >= 0:
+        return fallback_y(box, cfg)
+
+    pred = slope * pixel + intercept
+    residual = np.abs(value - pred)
+
+    if len(clean) >= 4:
+        keep = residual <= max(2.0, float(np.median(residual) + 2.5 * np.std(residual)))
+
+        if keep.sum() >= 2:
+            value = value[keep]
+            pixel = pixel[keep]
+            slope, intercept = np.polyfit(pixel, value, 1)
+            pred = slope * pixel + intercept
+            residual = np.abs(value - pred)
+
+    return LinearAxisFit(
+        float(slope),
+        float(intercept),
+        float(np.sqrt(np.mean(residual**2))),
+        len(value),
+        "doctr_axis_region_linear",
+    )
+
+
+def select_x_ticks(ocr: list[OcrWord], image: np.ndarray, box: Box, cfg: Config) -> list[AxisLabel]:
+    h, w = image.shape[:2]
+
+    ticks = [
+        (word, values)
+        for word, values in tick_ocr(ocr, "x", cfg)
+        if box.bottom - h * 0.06 <= word.cy <= min(h, box.bottom + h * 0.12)
+        and max(0, box.left - w * 0.08) <= word.cx <= min(w, box.right + w * 0.10)
+    ]
+
+    best: list[AxisLabel] = []
+
+    for group in group_items(ticks, key=lambda item: item[0].cy, tol=max(10, h * 0.012)):
+        labels = [
+            AxisLabel(
+                text=word.text,
+                axis_value=float(values[0]),
+                tick_pixel=float(word.cx),
+                left=word.left,
+                top=word.top,
+                right=word.right,
+                bottom=word.bottom,
+                conf=word.conf,
+                inlier=True,
+            )
+            for word, values in group
+        ]
+
+        if not labels:
+            continue
+
+        labels = sorted(labels, key=lambda item: item.tick_pixel)
+        monotonic = [labels[0]]
+
+        for label in labels[1:]:
+            if label.axis_value < monotonic[-1].axis_value:
+                monotonic.append(label)
+
+        if len(monotonic) < 3:
+            continue
+
+        values = np.array([label.axis_value for label in monotonic], dtype=float)
+
+        if values.max() - values.min() < 1000:
+            continue
+
+        if len(monotonic) > len(best):
+            best = monotonic
+
+    return best
+
+
+def make_inferred_y100_label(original: list[AxisLabel], stable: list[AxisLabel], box: Box, cfg: Config) -> AxisLabel:
+    fit = fit_y_stable(stable, box, cfg)
+    y100 = fit.pixel_at(100.0)
+    source = next((label for label in original if np.isclose(label.axis_value, 100.0)), None)
+    base = source or stable[0]
+
+    return AxisLabel(
+        text=f"{base.text}*" if source else "100*",
+        axis_value=100.0,
+        tick_pixel=float(y100),
+        left=base.left,
+        top=base.top,
+        right=base.right,
+        bottom=base.bottom,
+        conf=base.conf,
+        inlier=False,
+    )
+
+
+def select_y_ticks(ocr: list[OcrWord], image: np.ndarray, box: Box, cfg: Config) -> list[AxisLabel]:
+    h, w = image.shape[:2]
+
+    ticks = [
+        (word, values)
+        for word, values in tick_ocr(ocr, "y", cfg)
+        if max(0, box.left - w * 0.14) <= word.cx <= min(w, box.left + w * 0.055)
+        and max(0, box.top - h * 0.12) <= word.cy <= min(h, box.bottom + h * 0.10)
+    ]
+
+    choices: list[tuple[tuple[float, int, float], list[AxisLabel]]] = []
+
+    for group in group_items(ticks, key=lambda item: item[0].cx, tol=max(14, w * 0.012)):
+        labels = [
+            AxisLabel(
+                text=word.text,
+                axis_value=float(max(values)),
+                tick_pixel=float(word.cy),
+                left=word.left,
+                top=word.top,
+                right=word.right,
+                bottom=word.bottom,
+                conf=word.conf,
+                inlier=True,
+            )
+            for word, values in group
+            if 0 <= max(values) <= 100
+        ]
+
+        stable = [
+            label
+            for label in labels
+            if 0 <= label.axis_value <= 90 and not np.isclose(label.axis_value, 100.0)
+        ]
+
+        preferred_values = {90, 80, 70, 60, 50, 40, 30, 20, 10}
+        preferred = [label for label in stable if label.axis_value in preferred_values]
+
+        if len(preferred) >= 2:
+            stable = preferred
+
+        if len(stable) < 2:
+            continue
+
+        stable = sorted(stable, key=lambda item: item.axis_value, reverse=True)
+        values = np.array([label.axis_value for label in stable], dtype=float)
+
+        if not np.all(np.diff(values) < 0):
+            continue
+
+        fit = fit_y_stable(stable, box, cfg)
+        pixels = np.array([label.tick_pixel for label in stable], dtype=float)
+        residual = np.abs(values - fit.value_at(pixels))
+
+        marked = [
+            replace(label, inlier=bool(res <= 8))
+            for label, res in zip(stable, residual)
+        ]
+
+        clean = clean_labels(marked)
+
+        if len(clean) < 2:
+            continue
+
+        display_group = clean + [make_inferred_y100_label(labels, clean, box, cfg)]
+
+        score = (
+            float(max(label.axis_value for label in clean) - min(label.axis_value for label in clean)),
+            len(clean),
+            -fit.rmse,
+        )
+
+        choices.append((score, display_group))
+
+    return max(choices, key=lambda item: item[0])[1] if choices else []
+
+
+def calibrate_axes(image: np.ndarray, box: Box, ocr: list[OcrWord], cfg: Config):
+    x_labels = select_x_ticks(ocr, image, box, cfg)
+    y_labels = select_y_ticks(ocr, image, box, cfg)
+
+    x_fit = fit_x(x_labels) or fallback_x(box, cfg)
+    y_fit = fit_y_stable(y_labels, box, cfg)
+
+    return x_fit, y_fit, x_labels, y_labels
+
+
+def resample_digitized_arrays(data: dict[str, np.ndarray], n: int) -> dict[str, np.ndarray]:
+    if n <= 0 or len(data["x"]) <= n:
+        return data
+
+    order = np.argsort(data["x"])
+    x = data["x"][order]
+
+    keep = np.r_[True, np.diff(x) > 1e-9]
+    order = order[keep]
+    x = data["x"][order]
+
+    if len(x) <= n:
+        desc = np.argsort(data["x"][order])[::-1]
+        order = order[desc]
+        return {key: value[order] for key, value in data.items()}
+
+    grid = np.linspace(float(x.min()), float(x.max()), n)
+
+    out = {
+        "x": grid,
+        "y": np.interp(grid, x, data["y"][order]),
+        "px_abs": np.interp(grid, x, data["px_abs"][order]),
+        "py_abs": np.interp(grid, x, data["py_abs"][order]),
+    }
+
+    desc = np.argsort(out["x"])[::-1]
+    return {key: value[desc] for key, value in out.items()}
+
+
+def digitize_curve(curve_abs: Curve, x_fit, y_fit, cfg: Config) -> dict[str, np.ndarray]:
+    if len(curve_abs["px_abs"]) == 0:
+        return {
+            "x": np.array([], dtype=np.float64),
+            "y": np.array([], dtype=np.float64),
+            "px_abs": np.array([], dtype=np.float64),
+            "py_abs": np.array([], dtype=np.float64),
+        }
+
+    data = {
+        "x": np.asarray(x_fit.value_at(curve_abs["px_abs"]), dtype=np.float64),
+        "y": np.asarray(y_fit.value_at(curve_abs["py_abs"]), dtype=np.float64),
+        "px_abs": curve_abs["px_abs"].astype(np.float64),
+        "py_abs": curve_abs["py_abs"].astype(np.float64),
+    }
+
+    order = np.argsort(data["x"])[::-1]
+    data = {key: value[order] for key, value in data.items()}
+
+    return resample_digitized_arrays(data, cfg.output_points)
+
+
+def digitized_frame(data: dict[str, np.ndarray]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "x": data["x"],
+            "y": data["y"],
+        }
+    )
+
+
+def overlay_curve_abs(image: np.ndarray, curve_abs: Curve) -> np.ndarray:
+    out = image.copy()
+
+    px = curve_abs.get("px_abs", np.array([]))
+    py = curve_abs.get("py_abs", np.array([]))
+
+    if len(px) == 0:
+        return out
+
+    pts = np.column_stack([px, py]).astype(float)
+
+    for a, b in zip(pts[:-1], pts[1:]):
+        cv2.line(
+            out,
+            (int(round(a[0])), int(round(a[1]))),
+            (int(round(b[0])), int(round(b[1]))),
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return out
+
+
+def draw_axis_debug(
+    image: np.ndarray,
+    box: Box,
+    curve_abs: Curve,
+    x_labels: list[AxisLabel],
+    y_labels: list[AxisLabel],
+    x_fit,
+    y_fit,
+) -> np.ndarray:
+    out = overlay_curve_abs(image.copy(), curve_abs)
+    cv2.rectangle(out, (box.left, box.top), (box.right, box.bottom), (255, 0, 0), 2)
+
+    for labels, color in [(x_labels, (255, 140, 0)), (y_labels, (0, 180, 255))]:
+        for label in labels:
+            c = color if label.inlier else (255, 0, 0)
+
+            cv2.rectangle(
+                out,
+                (int(label.left), int(label.top)),
+                (int(label.right), int(label.bottom)),
+                c,
+                2,
+            )
+
+            cv2.putText(
+                out,
+                f"{label.axis_value:g}",
+                (int(label.left), max(15, int(label.top) - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                c,
+                1,
+                cv2.LINE_AA,
+            )
+
+            if color == (0, 180, 255):
+                cv2.circle(out, (box.left, int(round(label.tick_pixel))), 4, c, -1)
+            else:
+                cv2.circle(out, (int(round(label.tick_pixel)), box.bottom), 4, c, -1)
+
+    return out
+
+
+def spectrum_image(data: dict[str, np.ndarray], width: int = 1200, height: int = 700) -> np.ndarray:
+    canvas = np.full((height, width, 3), 255, np.uint8)
+
+    if len(data["x"]) == 0:
+        return canvas
+
+    ml, mr, mt, mb = 95, 45, 45, 75
+    pw = width - ml - mr
+    ph = height - mt - mb
+
+    x = data["x"].astype(float)
+    y = data["y"].astype(float)
+
+    x_min, x_max = float(np.nanmin(x)), float(np.nanmax(x))
+    y_min = min(0.0, float(np.nanmin(y)))
+    y_max = max(100.0, float(np.nanmax(y)))
+
+    px = ml + (x_max - x) / max(1e-9, x_max - x_min) * pw
+    py = mt + (y_max - y) / max(1e-9, y_max - y_min) * ph
+
+    left, right = ml, ml + pw
+    top, bottom = mt, mt + ph
+
+    cv2.rectangle(canvas, (left, top), (right, bottom), (0, 0, 0), 1)
+
+    x_ticks = np.linspace(x_max, x_min, 8)
+    y_ticks = np.linspace(y_min, y_max, 6)
+
+    for value in x_ticks:
+        tx = int(round(left + (x_max - value) / max(1e-9, x_max - x_min) * pw))
+        cv2.line(canvas, (tx, bottom), (tx, bottom + 6), (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"{value:.0f}",
+            (tx - 24, bottom + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    for value in y_ticks:
+        ty = int(round(top + (y_max - value) / max(1e-9, y_max - y_min) * ph))
+        cv2.line(canvas, (left - 6, ty), (left, ty), (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"{value:.0f}",
+            (left - 48, ty + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    pts = np.column_stack([px, py]).astype(np.int32)
+
+    for a, b in zip(pts[:-1], pts[1:]):
+        cv2.line(canvas, tuple(a), tuple(b), (255, 0, 0), 1, cv2.LINE_AA)
+
+    return canvas
+
+def digitize(image_path: Path, output_dir: Path, cfg: Config) -> dict:
+    validate_input(image_path)
+
+    image = read_image(image_path)
+    box, box_type = detect_plot_box(image, cfg)
+    trace = extract_curve(image, box, cfg)
+
+    ocr_engine = DoctrOcr()
+    ocr = ocr_engine(image)
+    x_fit, y_fit, x_labels, y_labels = calibrate_axes(image, box, ocr, cfg)
+    data = digitize_curve(trace["curve_abs"], x_fit, y_fit, cfg)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    axis_debug_path = output_dir / "axis_debug.png"
+    spectrum_path = output_dir / "spectrum.png"
+    csv_path = output_dir / "digitized_spectrum.csv"
+
+    save_rgb(axis_debug_path, draw_axis_debug(image, box, trace["curve_abs"], x_labels, y_labels, x_fit, y_fit))
+    save_rgb(spectrum_path, spectrum_image(data))
+    digitized_frame(data).write_csv(csv_path)
+
+    return {
+        "source": str(image_path),
+        "box_type": box_type,
+        "box": box,
+        "stroke_width": float(trace["stroke_width"]),
+        "x_fit_source": getattr(x_fit, "source", type(x_fit).__name__),
+        "x_fit_count": int(x_fit.count),
+        "x_left_value": float(x_fit.value_at(box.left)),
+        "x_right_value": float(x_fit.value_at(box.right)),
+        "y_fit_source": y_fit.source,
+        "y_fit_count": int(y_fit.count),
+        "y_fit_rmse": float(y_fit.rmse),
+        "y_top_value": float(y_fit.value_at(box.top)),
+        "y_bottom_value": float(y_fit.value_at(box.bottom)),
+        "data_x_min": float(np.nanmin(data["x"])) if len(data["x"]) else np.nan,
+        "data_x_max": float(np.nanmax(data["x"])) if len(data["x"]) else np.nan,
+        "data_y_min": float(np.nanmin(data["y"])) if len(data["y"]) else np.nan,
+        "data_y_max": float(np.nanmax(data["y"])) if len(data["y"]) else np.nan,
+        "points": len(data["x"]),
+        "axis_debug": str(axis_debug_path),
+        "spectrum": str(spectrum_path),
+        "digitized_csv": str(csv_path),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Digitize an IR spectrum image into a numerical spectrum.")
+    parser.add_argument("--input", required=True, type=Path, help="Input spectrum image.")
+    parser.add_argument("--out", required=True, type=Path, help="Output directory.")
+    parser.add_argument("--output-points", type=int, default=1800)
+    parser.add_argument("--fallback-x-start", type=float, default=4000.0)
+    parser.add_argument("--fallback-x-end", type=float, default=500.0)
+    parser.add_argument("--fallback-y-min", type=float, default=0.0)
+    parser.add_argument("--fallback-y-max", type=float, default=100.0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = Config(
+        output_points=args.output_points,
+        fallback_x_start=args.fallback_x_start,
+        fallback_x_end=args.fallback_x_end,
+        fallback_y_min=args.fallback_y_min,
+        fallback_y_max=args.fallback_y_max,
+    )
+
+    row = digitize(args.input, args.out, cfg)
+    box = row["box"]
+
+    print("OK:", row["source"])
+    print("box:", box.left, box.top, box.right, box.bottom, row["box_type"])
+    print("stroke_width:", round(row["stroke_width"], 3))
+    print("x_fit:", row["x_fit_source"], "count:", row["x_fit_count"])
+    print("x_range:", row["x_left_value"], "->", row["x_right_value"])
+    print("y_fit:", row["y_fit_source"], "count:", row["y_fit_count"], "rmse:", row["y_fit_rmse"])
+    print("y_range:", row["y_top_value"], "->", row["y_bottom_value"])
+    print("data:", row["data_x_min"], row["data_x_max"], row["data_y_min"], row["data_y_max"])
+    print("points:", row["points"])
+    print("axis_debug:", row["axis_debug"])
+    print("spectrum:", row["spectrum"])
+    print("digitized_csv:", row["digitized_csv"])
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+File: ./scripts/evaluate.py
+================================================================================
+
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+from pathlib import Path
+
+LAUNCH_DIR = Path.cwd()
+
+import polars as pl
+
+from ckan_specnet.core import Config, configure_torch_runtime, device_of
+from ckan_specnet.eval import (
+    evaluate_saved_ensemble_on_eval_sets,
+    load_manifest,
+    save_evaluation_tables,
+    tasks_from_manifest,
+)
+from ckan_specnet.paths import EvalPaths
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate released five-fold CKAN-SpecNet models."
+    )
+    parser.add_argument("--test", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    paths = EvalPaths.from_args(args, LAUNCH_DIR)
+
+    configure_torch_runtime()
+
+    manifest = load_manifest(paths.run_dir)
+    tasks = tasks_from_manifest(manifest)
+    test_df = pl.read_parquet(paths.test)
+
+    cfg = replace(
+        Config(),
+        test_parquet=paths.test,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+
+    results = evaluate_saved_ensemble_on_eval_sets(
+        run_dir=paths.run_dir,
+        manifest=manifest,
+        test_df=test_df,
+        tasks=tasks,
+        cfg=cfg,
+        device=device_of(),
+    )
+
+    summary = save_evaluation_tables(results, paths.out)
+    print(summary)
+    print(f"Saved evaluation tables to: {paths.out}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+File: ./scripts/train.py
+================================================================================
+
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, replace
+from datetime import datetime
+from pathlib import Path
+
+LAUNCH_DIR = Path.cwd()
+
+import numpy as np
+import polars as pl
+import torch
+import torch.optim as optim
+from sklearn.model_selection import KFold
+from sklearn.utils.class_weight import compute_class_weight
+
+from ckan_specnet.core import (
+    TASKS,
+    Config,
+    ModelConfig,
+    clear_cuda,
+    configure_torch_runtime,
+    device_of,
+    seed_everything,
+    unwrap_model,
+)
+from ckan_specnet.data import (
+    Preprocessor,
+    load_train_data_excluding_test,
+    make_loader,
+    prepare_or_load_test_parquet,
+    take,
+)
+from ckan_specnet.eval import (
+    Poly1Loss,
+    evaluate_saved_ensemble_on_eval_sets,
+    predict,
+    save_evaluation_tables,
+    summarize_metrics,
+    task_metrics,
+)
+from ckan_specnet.model import build_model
+from ckan_specnet.paths import TrainPaths
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train five-fold CKAN-SpecNet models.")
+    parser.add_argument("--parquet", type=Path, required=True)
+    parser.add_argument("--test", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--name", type=str, default="ContributionKAN_b64_a001_avgmax_norm")
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=5e-2)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument("--save-fp16", action="store_true")
+    parser.add_argument("--skip-eval", action="store_true")
+    return parser.parse_args()
+
+
+def make_class_weights(
+    y: dict[str, np.ndarray],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    out = {}
+
+    for task, values in y.items():
+        n_classes = TASKS.num_classes[task]
+        weights = np.ones(n_classes, dtype=np.float32)
+        present = np.unique(values)
+
+        balanced = compute_class_weight(
+            class_weight="balanced",
+            classes=present,
+            y=values,
+        ).astype(np.float32)
+
+        for cls, weight in zip(present, balanced, strict=True):
+            weights[cls] = weight
+
+        out[task] = torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+    return out
+
+
+def make_losses(
+    y: dict[str, np.ndarray],
+    device: torch.device,
+) -> dict[str, Poly1Loss]:
+    weights = make_class_weights(y, device)
+
+    return {
+        task: Poly1Loss(
+            n_classes=TASKS.num_classes[task],
+            epsilon=1.0,
+            weight=weights[task],
+        )
+        for task in TASKS.all
+    }
+
+
+def total_loss(
+    outputs: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    losses: dict[str, Poly1Loss],
+) -> torch.Tensor:
+    return torch.stack(
+        [losses[task](outputs[task], targets[task]) for task in TASKS.all]
+    ).sum()
+
+
+def build_optimizer(
+    model: torch.nn.Module,
+    lr: float,
+    weight_decay: float,
+) -> optim.Optimizer:
+    decay, no_decay = [], []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        lower = name.lower()
+
+        if (
+            param.ndim <= 1
+            or "bias" in lower
+            or "norm" in lower
+            or "bn" in lower
+            or "alpha" in lower
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    return optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
+
+
+def maybe_compile(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
+    return torch.compile(model) if enabled else model
+
+
+def model_regularization_loss(
+    model: torch.nn.Module,
+    device: torch.device,
+) -> torch.Tensor:
+    base = unwrap_model(model)
+
+    if hasattr(base, "regularization_loss") and callable(base.regularization_loss):
+        reg = base.regularization_loss()
+        if isinstance(reg, torch.Tensor):
+            return reg
+
+    return torch.zeros((), dtype=torch.float32, device=device)
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    loader,
+    optimizer: optim.Optimizer,
+    losses: dict[str, Poly1Loss],
+    device: torch.device,
+) -> float:
+    model.train()
+
+    total = 0.0
+    steps = 0
+    skipped = 0
+
+    for x, y in loader:
+        if x.shape[0] < 2:
+            skipped += 1
+            continue
+
+        x = x.to(device, non_blocking=True)
+        y = {task: target.to(device, non_blocking=True) for task, target in y.items()}
+
+        optimizer.zero_grad(set_to_none=True)
+
+        outputs = model(x)
+        loss = total_loss(outputs, y, losses) + model_regularization_loss(model, device)
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite training loss: {loss.item()}")
+
+        loss.backward()
+        optimizer.step()
+
+        total += float(loss.detach().cpu())
+        steps += 1
+
+    if skipped:
+        print(f"Skipped singleton batches: {skipped}")
+
+    if steps == 0:
+        raise RuntimeError("No training batches were processed.")
+
+    return total / steps
+
+
+def evaluate_model(
+    model: torch.nn.Module,
+    x: np.ndarray,
+    y: dict[str, np.ndarray],
+    preprocessor: Preprocessor,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    loader = make_loader(
+        x=x,
+        y=y,
+        preprocessor=preprocessor,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        device=device,
+    )
+
+    y_true, y_pred, prob = predict(model, loader, TASKS, device)
+    metrics = task_metrics(y_true, y_pred, TASKS)
+
+    return {
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "prob": prob,
+        "metrics": metrics,
+        "summary": summarize_metrics(metrics),
+    }
+
+
+def tensor_to_save(t: torch.Tensor, fp16: bool = False) -> torch.Tensor:
+    t = t.detach().cpu()
+    return t.half() if fp16 and t.is_floating_point() else t
+
+
+def save_fold_checkpoint(
+    model: torch.nn.Module,
+    fold: int,
+    best_score: float,
+    run_dir: Path,
+    input_size: int,
+    model_cfg: ModelConfig,
+    cfg: Config,
+) -> Path:
+    state_dict = {
+        key: tensor_to_save(value, fp16=cfg.save_fp16)
+        for key, value in unwrap_model(model).state_dict().items()
+    }
+
+    ckpt = {
+        "fold": int(fold + 1),
+        "best_score": float(best_score),
+        "input_size": int(input_size),
+        "model_config": asdict(model_cfg),
+        "task_config": TASKS.to_dict(),
+        "normalize": cfg.normalize,
+        "save_fp16": bool(cfg.save_fp16),
+        "state_dict": state_dict,
+    }
+
+    path = run_dir / f"fold_{fold + 1}.pt"
+    torch.save(ckpt, path)
+
+    return path
+
+
+def fit_fold_and_save(
+    fold: int,
+    train_idx: np.ndarray,
+    valid_idx: np.ndarray,
+    x: np.ndarray,
+    y: dict[str, np.ndarray],
+    model_cfg: ModelConfig,
+    cfg: Config,
+    run_dir: Path,
+    device: torch.device,
+) -> dict:
+    print(f"\nFold {fold + 1}/{cfg.folds}: train={len(train_idx):,} valid={len(valid_idx):,}")
+
+    train_y = take(y, train_idx)
+    valid_y = take(y, valid_idx)
+    preprocessor = Preprocessor(cfg.normalize).fit(x[train_idx])
+
+    train_loader = make_loader(
+        x=x[train_idx],
+        y=train_y,
+        preprocessor=preprocessor,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        device=device,
+    )
+
+    model = build_model(x.shape[1], model_cfg, TASKS).to(device)
+    model = maybe_compile(model, cfg.compile_model)
+
+    optimizer = build_optimizer(unwrap_model(model), cfg.lr, cfg.weight_decay)
+    losses = make_losses(train_y, device)
+
+    best_score = -np.inf
+    best_state = None
+    wait = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, losses, device)
+
+        valid = evaluate_model(
+            model=model,
+            x=x[valid_idx],
+            y=valid_y,
+            preprocessor=preprocessor,
+            cfg=cfg,
+            device=device,
+        )
+
+        score = valid["summary"]["overall_acc"]
+
+        print(
+            f"fold={fold + 1} epoch={epoch:03d} "
+            f"loss={train_loss:.4f} "
+            f"val_acc={valid['summary']['overall_acc']:.2f} "
+            f"val_f1={valid['summary']['overall_f1']:.2f}"
+        )
+
+        if score > best_score:
+            best_score = score
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in unwrap_model(model).state_dict().items()
+            }
+            wait = 0
+        else:
+            wait += 1
+
+        if wait >= cfg.patience:
+            print(f"early stop @ epoch {epoch}")
+            break
+
+    if best_state is not None:
+        unwrap_model(model).load_state_dict(best_state)
+
+    fold_path = save_fold_checkpoint(
+        model=model,
+        fold=fold,
+        best_score=best_score,
+        run_dir=run_dir,
+        input_size=x.shape[1],
+        model_cfg=model_cfg,
+        cfg=cfg,
+    )
+
+    model.to("cpu")
+    del model
+    clear_cuda()
+
+    print(f"Saved fold {fold + 1}: {fold_path}")
+    print(f"Fold {fold + 1} best val_acc={best_score:.2f}")
+
+    return {
+        "fold": int(fold + 1),
+        "path": fold_path.name,
+        "best_score": float(best_score),
+    }
+
+
+def train_cv_and_save(
+    name: str,
+    x: np.ndarray,
+    y: dict[str, np.ndarray],
+    model_cfg: ModelConfig,
+    cfg: Config,
+    run_dir: Path,
+    device: torch.device,
+) -> dict:
+    cv = KFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.seed)
+    fold_records = []
+
+    for fold, (train_idx, valid_idx) in enumerate(cv.split(x)):
+        record = fit_fold_and_save(
+            fold=fold,
+            train_idx=train_idx,
+            valid_idx=valid_idx,
+            x=x,
+            y=y,
+            model_cfg=model_cfg,
+            cfg=cfg,
+            run_dir=run_dir,
+            device=device,
+        )
+        fold_records.append(record)
+
+    val_scores = [record["best_score"] for record in fold_records]
+
+    manifest = {
+        "name": name,
+        "created_at": datetime.now().isoformat(),
+        "config": {
+            "parquet": str(cfg.parquet),
+            "test_parquet": str(cfg.test_parquet),
+            "train_sources": list(cfg.train_sources),
+            "eval_sources": {key: list(value) for key, value in cfg.eval_sources.items()},
+            "require_eval_sources": cfg.require_eval_sources,
+            "single_component_only": cfg.single_component_only,
+            "seed": cfg.seed,
+            "test_size": cfg.test_size,
+            "folds": cfg.folds,
+            "batch_size": cfg.batch_size,
+            "epochs": cfg.epochs,
+            "patience": cfg.patience,
+            "lr": cfg.lr,
+            "weight_decay": cfg.weight_decay,
+            "normalize": cfg.normalize,
+            "compile_model": cfg.compile_model,
+            "save_fp16": cfg.save_fp16,
+        },
+        "model_config": asdict(model_cfg),
+        "task_config": TASKS.to_dict(),
+        "input_size": int(x.shape[1]),
+        "ensemble": {
+            "method": "soft_voting_probability_mean",
+            "fold_files": [record["path"] for record in fold_records],
+        },
+        "folds": fold_records,
+        "val_scores": val_scores,
+        "val_score_mean": float(np.mean(val_scores)),
+        "val_score_std": float(np.std(val_scores)),
+    }
+
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, default=str)
+    )
+
+    return manifest
+
+
+def main() -> None:
+    args = parse_args()
+    paths = TrainPaths.from_args(args, LAUNCH_DIR)
+
+    configure_torch_runtime()
+
+    cfg = replace(
+        Config(),
+        parquet=paths.parquet,
+        test_parquet=paths.test,
+        save_dir=paths.out,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        patience=args.patience,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        folds=args.folds,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        compile_model=args.compile_model,
+        save_fp16=args.save_fp16,
+    )
+
+    seed_everything(cfg.seed)
+    device = device_of()
+    model_cfg = ModelConfig()
+
+    paths.out.mkdir(parents=True, exist_ok=True)
+
+    test_df = prepare_or_load_test_parquet(cfg, TASKS)
+    train_data = load_train_data_excluding_test(cfg, TASKS, test_df)
+
+    x_train = train_data["x_train"]
+    y_train = train_data["y_train"]
+
+    print(f"Train samples: {len(x_train):,}")
+    print(f"Features: {x_train.shape[1]}")
+    print(f"Run dir: {paths.out.resolve()}")
+
+    manifest = train_cv_and_save(
+        name=args.name,
+        x=x_train,
+        y=y_train,
+        model_cfg=model_cfg,
+        cfg=cfg,
+        run_dir=paths.out,
+        device=device,
+    )
+
+    print(
+        f"Validation mean={manifest['val_score_mean']:.2f}, "
+        f"std={manifest['val_score_std']:.2f}"
+    )
+
+    if not args.skip_eval:
+        eval_results = evaluate_saved_ensemble_on_eval_sets(
+            run_dir=paths.out,
+            manifest=manifest,
+            test_df=pl.read_parquet(paths.test),
+            tasks=TASKS,
+            cfg=cfg,
+            device=device,
+        )
+        summary = save_evaluation_tables(eval_results, paths.out)
+        print(summary)
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+File: ./scripts/plot_transition_evidence.py
+================================================================================
+
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+from pathlib import Path
+
+LAUNCH_DIR = Path.cwd()
+
+import matplotlib.pyplot as plt
+import polars as pl
+
+from ckan_specnet.core import Config, EVAL_NAME_COL, configure_torch_runtime, device_of
+from ckan_specnet.data import frame_to_xy
+from ckan_specnet.eval import load_manifest, tasks_from_manifest
+from ckan_specnet.paths import PlotPaths
+from ckan_specnet.plot import (
+    configure_matplotlib,
+    get_kan_contribution_sample,
+    load_plot_ensemble,
+    plot_transition_evidence,
+    predict_plot_ensemble,
+    select_correct_sample,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate transition-evidence plots.")
+    parser.add_argument("--test", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--eval-name", type=str, required=True)
+    parser.add_argument("--task", type=str, required=True)
+    parser.add_argument("--class-id", type=int, default=None)
+    parser.add_argument("--sample-index", type=int, default=None)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--smooth-window", type=int, default=15)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--no-pdf", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    paths = PlotPaths.from_args(args, LAUNCH_DIR)
+
+    configure_torch_runtime()
+    configure_matplotlib()
+
+    manifest = load_manifest(paths.run_dir)
+    tasks = tasks_from_manifest(manifest)
+
+    if args.task not in tasks.all:
+        raise ValueError(f"Unknown task: {args.task}")
+
+    test_df = pl.read_parquet(paths.test)
+    subset = test_df.filter(pl.col(EVAL_NAME_COL) == args.eval_name)
+
+    if subset.height == 0:
+        raise ValueError(f"Empty eval subset: {args.eval_name}")
+
+    x, y, _ = frame_to_xy(subset, tasks)
+
+    cfg = replace(
+        Config(),
+        test_parquet=paths.test,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+
+    device = device_of()
+    loaded = load_plot_ensemble(run_dir=paths.run_dir, tasks=tasks)
+
+    pred_result = predict_plot_ensemble(
+        models=loaded["models"],
+        preprocessors=loaded["preprocessors"],
+        x=x,
+        tasks=tasks,
+        cfg=cfg,
+        device=device,
+    )
+
+    if args.sample_index is not None:
+        sample_idx = int(args.sample_index)
+
+        if not 0 <= sample_idx < len(x):
+            raise IndexError(
+                f"sample-index={sample_idx} out of range for "
+                f"{args.eval_name} with {len(x)} samples."
+            )
+
+        final_class = int(pred_result["y_pred"][args.task][sample_idx])
+    else:
+        if args.class_id is None:
+            raise ValueError("Either --sample-index or --class-id is required.")
+
+        final_class = int(args.class_id)
+        sample_idx = select_correct_sample(
+            y_true=y,
+            pred_result=pred_result,
+            task=args.task,
+            cls=final_class,
+            rank=args.rank,
+        )
+
+        if sample_idx is None:
+            raise RuntimeError(
+                f"No correctly predicted sample found for "
+                f"task={args.task}, class={final_class}."
+            )
+
+    if final_class <= 0:
+        raise ValueError(
+            f"Selected class is {final_class}. Transition evidence requires class > 0."
+        )
+
+    sample = get_kan_contribution_sample(
+        models=loaded["models"],
+        preprocessors=loaded["preprocessors"],
+        x=x,
+        y=y,
+        pred_result=pred_result,
+        task=args.task,
+        sample_idx=sample_idx,
+        device=device,
+    )
+
+    paths.out.mkdir(parents=True, exist_ok=True)
+    max_class = min(final_class, tasks.num_classes[args.task] - 1)
+
+    for target_class in range(1, max_class + 1):
+        reference_class = target_class - 1
+        save_path = (
+            paths.out
+            / f"{args.task}_sample{sample_idx}_true{sample['true']}_pred{sample['pred']}_C{reference_class}_to_C{target_class}.png"
+        )
+
+        fig = plot_transition_evidence(
+            sample=sample,
+            target_class=target_class,
+            reference_class=reference_class,
+            smooth_window=args.smooth_window,
+            save_path=save_path,
+            save_pdf=not args.no_pdf,
+        )
+
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+
+    print(f"Done: {paths.out}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+File: ./.python-version
+================================================================================
+
+3.12
+
+
+================================================================================
+File: ./pyproject.toml
+================================================================================
+
+[project]
+name = "ckan-specnet"
+version = "0.1.0"
+description = "Interpretable multi-task model for MIR spectral functional-group analysis."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "polars",
+    "pyarrow",
+    "torch",
+    "scikit-learn",
+    "matplotlib",
+    "ikan",
+    "ruff"
+]
+
+[project.optional-dependencies]
+digitization = [
+    "opencv-python-headless",
+    "imageio",
+    "python-doctr[torch]",
+]
+
+dev = [
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ckan_specnet"]
+
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+
+================================================================================
+File: ./ckan_specnet/plot.py
+================================================================================
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+
+from ckan_specnet.core import COMMON_X, Config, TaskCatalog, clear_cuda
+from ckan_specnet.data import Preprocessor, make_loader
+from ckan_specnet.eval import load_fold_model, load_manifest, predict
+
+
+def configure_matplotlib() -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 16,
+            "axes.titlesize": 18,
+            "axes.labelsize": 18,
+            "xtick.labelsize": 15,
+            "ytick.labelsize": 15,
+            "legend.fontsize": 15,
+            "figure.titlesize": 20,
+        }
+    )
+
+
+def load_plot_ensemble(
+    run_dir: Path,
+    tasks: TaskCatalog,
+    fold_files: list[str] | None = None,
+) -> dict:
+    run_dir = Path(run_dir)
+    manifest = load_manifest(run_dir)
+    fold_files = fold_files or manifest["ensemble"]["fold_files"]
+    normalize = manifest["config"]["normalize"]
+
+    models = []
+    checkpoints = []
+
+    for fold_file in fold_files:
+        model, ckpt = load_fold_model(run_dir / fold_file, tasks)
+        models.append(model)
+        checkpoints.append(ckpt)
+
+    return {
+        "run_dir": run_dir,
+        "manifest": manifest,
+        "models": models,
+        "checkpoints": checkpoints,
+        "preprocessors": [Preprocessor(normalize) for _ in models],
+        "fold_files": fold_files,
+    }
+
+
+@torch.inference_mode()
+def predict_plot_ensemble(
+    models: list[nn.Module],
+    preprocessors: list[Preprocessor],
+    x: np.ndarray,
+    tasks: TaskCatalog,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    fold_probs = []
+
+    for i, (model, preprocessor) in enumerate(
+        zip(models, preprocessors, strict=True), start=1
+    ):
+        print(f"Predicting fold {i}/{len(models)}")
+
+        model = model.to(device)
+        model.eval()
+
+        loader = make_loader(
+            x=x,
+            y=None,
+            preprocessor=preprocessor,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            device=device,
+        )
+
+        _, _, prob = predict(model, loader, tasks, device)
+        fold_probs.append(prob)
+
+        model.to("cpu")
+        clear_cuda()
+
+    prob = {
+        task: np.mean([fold_prob[task] for fold_prob in fold_probs], axis=0)
+        for task in tasks.all
+    }
+
+    pred = {task: values.argmax(axis=1) for task, values in prob.items()}
+
+    return {
+        "y_pred": pred,
+        "prob": prob,
+        "fold_probs": fold_probs,
+    }
+
+
+def smooth_1d(x, window=15):
+    x = np.asarray(x, dtype=np.float32)
+
+    if window is None or window <= 1:
+        return x
+
+    window = int(window)
+    window += int(window % 2 == 0)
+
+    return np.convolve(x, np.ones(window, dtype=np.float32) / window, mode="same")
+
+
+def task_display_name(task):
+    return {
+        "alkane": "Alkane",
+        "alkene": "Alkene",
+        "alkyne": "Alkyne",
+        "aromatics": "Aromatic ring",
+        "esters": "Ester",
+        "ketones": "Ketone",
+        "ortho": "Ortho",
+        "meta": "Meta",
+        "para": "Para",
+        "alkyl_halides": "Alkyl halide",
+        "alkyl_halides_4class": "Alkyl halide",
+        "alcohols": "Alcohol",
+        "alcohols_4class": "Alcohol",
+        "ether": "Ether",
+        "ether_4class": "Ether",
+        "amines": "Amine",
+        "amines_4class": "Amine",
+        "carbonyl_oxygen": "Carbonyl oxygen",
+        "carbonyl_oxygen_4class": "Carbonyl oxygen",
+        "aldehydes": "Aldehyde",
+        "aldehydes_3class": "Aldehyde",
+        "acyl_halides": "Acyl halide",
+        "acyl_halides_3class": "Acyl halide",
+        "amides": "Amide",
+        "amides_3class": "Amide",
+        "nitriles": "Nitrile",
+        "nitriles_3class": "Nitrile",
+        "nitro": "Nitro",
+        "nitro_3class": "Nitro",
+        "isocyanate": "Isocyanate",
+        "isocyanate_3class": "Isocyanate",
+        "isothiocyanate": "Isothiocyanate",
+        "isothiocyanate_3class": "Isothiocyanate",
+    }.get(task, task)
+
+
+def class_meaning(task, cls):
+    if cls == 0:
+        return "absent"
+
+    if task.endswith("_3class"):
+        return {1: "one", 2: "two or more"}.get(cls, f"class {cls}")
+
+    if task.endswith("_4class"):
+        return {1: "one", 2: "two", 3: "three or more"}.get(cls, f"class {cls}")
+
+    return "present" if cls == 1 else f"class {cls}"
+
+
+def find_correct_class_indices(y_true, pred_result, task, cls):
+    true = np.asarray(y_true[task])
+    pred = np.asarray(pred_result["y_pred"][task])
+    return np.where((true == cls) & (pred == cls))[0]
+
+
+def select_correct_sample(y_true, pred_result, task, cls, rank=0):
+    idx = find_correct_class_indices(y_true, pred_result, task, cls)
+
+    if len(idx) == 0:
+        return None
+
+    confidence = pred_result["prob"][task][idx, cls]
+    order = np.argsort(-confidence)
+    rank = min(int(rank), len(order) - 1)
+
+    return int(idx[order[rank]])
+
+
+@torch.inference_mode()
+def get_kan_contribution_sample(
+    models,
+    preprocessors,
+    x,
+    y,
+    pred_result,
+    task,
+    sample_idx,
+    device,
+):
+    raw = np.asarray(x[sample_idx], dtype=np.float32)
+    ens_prob = pred_result["prob"][task][sample_idx]
+    pred = int(np.argmax(ens_prob))
+    true = int(y[task][sample_idx]) if y is not None else -1
+
+    spectra = []
+    contribs = []
+    logits = []
+
+    for model, preprocessor in zip(models, preprocessors, strict=True):
+        spectrum = preprocessor(raw).astype(np.float32)
+
+        x_tensor = torch.as_tensor(
+            spectrum,
+            dtype=torch.float32,
+            device=device,
+        ).unsqueeze(0)
+
+        model = model.to(device)
+        model.eval()
+
+        outputs, contrib = model(
+            x_tensor,
+            return_contrib=True,
+            logit_mode="full",
+        )
+
+        spectra.append(spectrum)
+        contribs.append(contrib[task][0].detach().cpu().numpy())
+        logits.append(outputs[task][0].detach().cpu().numpy())
+
+        model.to("cpu")
+        clear_cuda()
+
+    return {
+        "task": task,
+        "sample_idx": int(sample_idx),
+        "spectrum": np.mean(spectra, axis=0),
+        "contrib": np.mean(contribs, axis=0),
+        "logits": np.mean(logits, axis=0),
+        "true": true,
+        "pred": pred,
+        "prob": ens_prob,
+    }
+
+
+def get_transition_evidence(
+    sample,
+    target_class,
+    reference_class,
+    smooth_window=15,
+):
+    evidence = sample["contrib"][target_class] - sample["contrib"][reference_class]
+    return smooth_1d(np.clip(evidence, 0, None), window=smooth_window)
+
+
+def plot_transition_evidence(
+    sample,
+    target_class,
+    reference_class,
+    smooth_window=15,
+    save_path=None,
+    save_pdf=True,
+):
+    spectrum = sample["spectrum"]
+
+    if len(COMMON_X) != len(spectrum):
+        raise ValueError(
+            f"COMMON_X length={len(COMMON_X)} != spectrum length={len(spectrum)}"
+        )
+
+    task = sample["task"]
+    n_classes = sample["contrib"].shape[0]
+
+    if target_class >= n_classes or reference_class >= n_classes:
+        raise ValueError(f"{task} has {n_classes} classes")
+
+    evidence = get_transition_evidence(
+        sample=sample,
+        target_class=target_class,
+        reference_class=reference_class,
+        smooth_window=smooth_window,
+    )
+
+    vmax = np.percentile(evidence, 99)
+    vmax = vmax if vmax > 1e-12 else float(evidence.max()) + 1e-12
+
+    y_min = float(np.min(spectrum))
+    y_max = float(np.max(spectrum))
+    y_pad = 0.08 * (y_max - y_min + 1e-12)
+    y_min -= y_pad
+    y_max += y_pad
+
+    fig, ax = plt.subplots(1, 1, figsize=(14.5, 5.2), constrained_layout=True)
+
+    im = ax.imshow(
+        np.clip(evidence / vmax, 0, 1)[np.newaxis, :],
+        aspect="auto",
+        cmap="YlOrRd",
+        extent=[float(COMMON_X[0]), float(COMMON_X[-1]), y_min, y_max],
+        alpha=0.62,
+        origin="lower",
+        vmin=0,
+        vmax=1,
+    )
+
+    ax.plot(COMMON_X, spectrum, color="black", linewidth=1.6, zorder=3, label="Spectrum")
+    ax.set_ylim(y_min, y_max)
+    ax.invert_xaxis()
+    ax.set_xlabel("Wavenumber / cm$^{-1}$", labelpad=8)
+    ax.set_ylabel("Normalized intensity", labelpad=8)
+    ax.set_title(
+        f"{task_display_name(task)} | sample {sample['sample_idx']} | "
+        f"true C{sample['true']} | pred C{sample['pred']} | "
+        f"C{reference_class} → C{target_class}",
+        pad=12,
+    )
+
+    cbar = fig.colorbar(im, ax=ax, orientation="vertical", fraction=0.026, pad=0.012)
+    cbar.set_label("Contribution evidence", labelpad=10)
+
+    ax.legend(loc="upper right", frameon=False)
+    ax.grid(False)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=300)
+
+        if save_pdf:
+            fig.savefig(save_path.with_suffix(".pdf"), bbox_inches="tight")
+
+    return fig
+
+
+================================================================================
+File: ./ckan_specnet/__init__.py
+================================================================================
+
+"""CKAN-SpecNet package."""
+
+from ckan_specnet.core import (
+    COMMON_X,
+    COMPONENTS,
+    EVAL_NAME_COL,
+    SAMPLE_ID_COL,
+    SOURCE,
+    SPECTRUM,
+    TASKS,
+    Config,
+    ModelConfig,
+    TaskCatalog,
+    clear_cuda,
+    configure_torch_runtime,
+    device_of,
+    seed_everything,
+    unwrap_model,
+)
+
+__all__ = [
+    "COMMON_X",
+    "COMPONENTS",
+    "EVAL_NAME_COL",
+    "SAMPLE_ID_COL",
+    "SOURCE",
+    "SPECTRUM",
+    "TASKS",
+    "Config",
+    "ModelConfig",
+    "TaskCatalog",
+    "clear_cuda",
+    "configure_torch_runtime",
+    "device_of",
+    "seed_everything",
+    "unwrap_model",
+]
+
+
+================================================================================
+File: ./ckan_specnet/core.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+SPECTRUM = "spectrum"
+SOURCE = "source_name"
+COMPONENTS = "component_count"
+EVAL_NAME_COL = "_eval_name"
+SAMPLE_ID_COL = "_sample_id"
+
+COMMON_X = np.arange(552, 3844, 2.0, dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class Config:
+    parquet: Path = Path("data/unified.parquet")
+    test_parquet: Path = Path("data/test.parquet")
+    save_dir: Path = Path("runs")
+
+    train_sources: tuple[str, ...] = ("sdbs", "nist_gas")
+    eval_sources: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: {
+            "swgdrug": ("swgdrug",),
+            "xps_digitized": ("xps_digitized",),
+        }
+    )
+
+    require_eval_sources: bool = True
+    single_component_only: bool = True
+
+    seed: int = 42
+    test_size: float = 0.2
+    folds: int = 5
+
+    batch_size: int = 1024
+    epochs: int = 10
+    patience: int = 5
+    lr: float = 1e-3
+    weight_decay: float = 5e-2
+
+    normalize: str = "sample_zscore"
+    compile_model: bool = False
+    num_workers: int = 0
+    save_fp16: bool = False
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    model_name: str = "cnn_contrib_kan"
+
+    conv_channels: tuple[int, ...] = (32, 64, 128, 256)
+    conv_kernels: tuple[int, ...] = (15, 13, 11, 7)
+    pool_sizes: tuple[int | None, ...] = (3, 2, None, None)
+    eca_positions: tuple[int, ...] = (2, 3)
+
+    adaptive_pool_size: int = 64
+    adaptive_pool_mode: str = "avgmax"
+
+    fc_hidden: int = 1024
+    head_hidden: int = 256
+    dropout_fc: float = 0.7
+    dropout_head: float = 0.3
+    act_name: str = "relu"
+
+    kan_grid_size: int = 3
+    kan_spline_order: int = 3
+    kan_scale_noise: float = 0.01
+    kan_scale_base: float = 0.5
+    kan_scale_spline: float = 0.1
+    kan_grid_eps: float = 0.02
+    kan_grid_range: tuple[float, float] = (-2.0, 2.0)
+
+    contrib_num_basis: int = 64
+    contrib_hidden: int = 32
+    contrib_alpha_init: float = 0.01
+    contrib_signal_norm: bool = False
+    contrib_init_std: float = 1e-3
+
+    contrib_lap_lambda: float = 1e-3
+    contrib_lap_on: str = "weight"
+
+
+@dataclass(frozen=True)
+class TaskCatalog:
+    binary: tuple[str, ...]
+    ternary: tuple[str, ...]
+    quaternary: tuple[str, ...]
+    num_classes: dict[str, int]
+    all: tuple[str, ...]
+
+    @staticmethod
+    def build() -> "TaskCatalog":
+        binary = (
+            "alkane",
+            "alkene",
+            "alkyne",
+            "aromatics",
+            "esters",
+            "ketones",
+            "ortho",
+            "meta",
+            "para",
+            "alkyl_halides",
+            "alcohols",
+            "ether",
+            "amines",
+            "carbonyl_oxygen",
+            "aldehydes",
+            "acyl_halides",
+            "amides",
+            "nitriles",
+            "nitro",
+            "isocyanate",
+            "isothiocyanate",
+        )
+        ternary = (
+            "aldehydes",
+            "acyl_halides",
+            "amides",
+            "nitriles",
+            "nitro",
+            "isocyanate",
+            "isothiocyanate",
+        )
+        quaternary = (
+            "alkyl_halides",
+            "alcohols",
+            "ether",
+            "amines",
+            "carbonyl_oxygen",
+        )
+
+        num_classes = {task: 2 for task in binary}
+        num_classes |= {f"{task}_3class": 3 for task in ternary}
+        num_classes |= {f"{task}_4class": 4 for task in quaternary}
+
+        return TaskCatalog(
+            binary=binary,
+            ternary=ternary,
+            quaternary=quaternary,
+            num_classes=num_classes,
+            all=tuple(num_classes),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "binary": list(self.binary),
+            "ternary": list(self.ternary),
+            "quaternary": list(self.quaternary),
+            "num_classes": dict(self.num_classes),
+            "all": list(self.all),
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "TaskCatalog":
+        return TaskCatalog(
+            binary=tuple(data["binary"]),
+            ternary=tuple(data["ternary"]),
+            quaternary=tuple(data["quaternary"]),
+            num_classes={key: int(value) for key, value in data["num_classes"].items()},
+            all=tuple(data["all"]),
+        )
+
+
+TASKS = TaskCatalog.build()
+
+
+def configure_torch_runtime() -> None:
+    torch.set_float32_matmul_precision("high")
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+def seed_everything(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def device_of() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def clear_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+================================================================================
+File: ./ckan_specnet/eval.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    accuracy_score,
+    cohen_kappa_score,
+    precision_recall_fscore_support,
+)
+
+from ckan_specnet.core import Config, ModelConfig, TaskCatalog, clear_cuda
+from ckan_specnet.data import Preprocessor, load_eval_sets_from_test_parquet, make_loader
+from ckan_specnet.model import build_model
+
+
+class Poly1Loss(nn.Module):
+    def __init__(self, n_classes: int, epsilon: float = 1.0, weight=None):
+        super().__init__()
+        self.n_classes = n_classes
+        self.epsilon = epsilon
+        self.weight = weight
+
+    def forward(self, logits, target):
+        ce = F.cross_entropy(logits, target, weight=self.weight, reduction="none")
+        pt = F.softmax(logits, dim=1).gather(1, target[:, None]).squeeze(1)
+        return (ce + self.epsilon * (1 - pt)).mean()
+
+
+def finite_mean(values) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else np.nan
+
+
+def finite_std(values) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return float(values.std()) if values.size else np.nan
+
+
+def task_metrics(
+    y_true: dict[str, np.ndarray],
+    y_pred: dict[str, np.ndarray],
+    tasks: TaskCatalog,
+) -> pl.DataFrame:
+    rows = []
+
+    for task in tasks.all:
+        yt = np.asarray(y_true[task])
+        yp = np.asarray(y_pred[task])
+        n_classes = tasks.num_classes[task]
+        labels = list(range(n_classes))
+        observed = np.unique(yt)
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            yt,
+            yp,
+            labels=observed,
+            average="macro",
+            zero_division=0,
+        )
+
+        qwk = (
+            cohen_kappa_score(yt, yp, labels=labels, weights="quadratic")
+            if n_classes > 2 and observed.size > 1
+            else np.nan
+        )
+
+        rows.append(
+            {
+                "task": task,
+                "n_classes": n_classes,
+                "observed_labels": observed.tolist(),
+                "accuracy": accuracy_score(yt, yp) * 100,
+                "precision": precision * 100,
+                "recall": recall * 100,
+                "f1": f1 * 100,
+                "qwk": qwk,
+            }
+        )
+
+    return pl.DataFrame(rows)
+
+
+def summarize_metrics(metrics: pl.DataFrame) -> dict:
+    binary = metrics.filter(pl.col("n_classes") == 2)
+    multi = metrics.filter(pl.col("n_classes") > 2)
+
+    def mean(df: pl.DataFrame, col: str) -> float:
+        return finite_mean(df[col].to_numpy()) if df.height else np.nan
+
+    return {
+        "binary_tasks": binary.height,
+        "multiclass_tasks": multi.height,
+        "overall_tasks": metrics.height,
+        "binary_acc": mean(binary, "accuracy"),
+        "binary_precision": mean(binary, "precision"),
+        "binary_recall": mean(binary, "recall"),
+        "binary_f1": mean(binary, "f1"),
+        "multiclass_acc": mean(multi, "accuracy"),
+        "multiclass_precision": mean(multi, "precision"),
+        "multiclass_recall": mean(multi, "recall"),
+        "multiclass_f1": mean(multi, "f1"),
+        "multiclass_qwk": mean(multi, "qwk"),
+        "overall_acc": mean(metrics, "accuracy"),
+        "overall_precision": mean(metrics, "precision"),
+        "overall_recall": mean(metrics, "recall"),
+        "overall_f1": mean(metrics, "f1"),
+    }
+
+
+def summary_std(fold_summaries: list[dict]) -> dict:
+    if not fold_summaries:
+        return {}
+
+    skip = {"binary_tasks", "multiclass_tasks", "overall_tasks"}
+    keys = [key for key in fold_summaries[0] if key not in skip]
+
+    return {
+        f"{key}_std": finite_std(
+            [summary.get(key, np.nan) for summary in fold_summaries]
+        )
+        for key in keys
+    }
+
+
+def task_metrics_with_std(
+    ensemble_metrics: pl.DataFrame,
+    fold_metrics: list[pl.DataFrame],
+) -> pl.DataFrame:
+    rows = []
+
+    for task in ensemble_metrics["task"].to_list():
+        fold_rows = [
+            df.filter(pl.col("task") == task).to_dicts()[0] for df in fold_metrics
+        ]
+
+        rows.append(
+            {
+                "task": task,
+                **{
+                    f"{col}_std": finite_std(
+                        [row.get(col, np.nan) for row in fold_rows]
+                    )
+                    for col in ("accuracy", "precision", "recall", "f1", "qwk")
+                },
+            }
+        )
+
+    return ensemble_metrics.join(pl.DataFrame(rows), on="task", how="left")
+
+
+def csv_safe_df(df: pl.DataFrame) -> pl.DataFrame:
+    out = df.clone()
+
+    if "observed_labels" not in out.columns:
+        return out
+
+    labels_json = []
+
+    for value in out["observed_labels"].to_list():
+        if isinstance(value, pl.Series):
+            value = value.to_list()
+        elif isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif isinstance(value, tuple):
+            value = list(value)
+        elif value is None:
+            value = []
+        else:
+            value = list(value)
+
+        labels_json.append(json.dumps(value, ensure_ascii=False))
+
+    out = out.drop("observed_labels").with_columns(
+        pl.Series("observed_labels", labels_json)
+    )
+
+    cols = [col for col in out.columns if col != "observed_labels"]
+    insert_at = 2 if len(cols) >= 2 else len(cols)
+
+    return out.select(cols[:insert_at] + ["observed_labels"] + cols[insert_at:])
+
+
+@torch.inference_mode()
+def predict(
+    model: nn.Module,
+    loader,
+    tasks: TaskCatalog,
+    device: torch.device,
+):
+    model.eval()
+
+    y_true = {task: [] for task in tasks.all}
+    y_pred = {task: [] for task in tasks.all}
+    y_prob = {task: [] for task in tasks.all}
+    has_labels = False
+
+    for batch in loader:
+        if isinstance(batch, (tuple, list)):
+            x, y = batch
+            has_labels = True
+        else:
+            x, y = batch, None
+
+        outputs = model(x.to(device, non_blocking=True))
+
+        for task in tasks.all:
+            prob = F.softmax(outputs[task], dim=1).detach().cpu().numpy()
+            y_prob[task].append(prob)
+            y_pred[task].append(prob.argmax(axis=1))
+
+            if has_labels:
+                y_true[task].append(y[task].numpy())
+
+    y_pred = {task: np.concatenate(values) for task, values in y_pred.items()}
+    y_prob = {task: np.vstack(values) for task, values in y_prob.items()}
+
+    if not has_labels:
+        return None, y_pred, y_prob
+
+    y_true = {task: np.concatenate(values) for task, values in y_true.items()}
+
+    return y_true, y_pred, y_prob
+
+
+def load_manifest(run_dir: Path) -> dict:
+    path = Path(run_dir) / "manifest.json"
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    return json.loads(path.read_text())
+
+
+def tasks_from_manifest(manifest: dict) -> TaskCatalog:
+    if "task_config" in manifest:
+        return TaskCatalog.from_dict(manifest["task_config"])
+
+    return TaskCatalog.build()
+
+
+def load_fold_model(fold_path: Path, tasks: TaskCatalog) -> tuple[nn.Module, dict]:
+    ckpt = torch.load(fold_path, map_location="cpu", weights_only=False)
+    model_cfg = ModelConfig(**ckpt["model_config"])
+
+    model = build_model(
+        input_size=int(ckpt["input_size"]),
+        cfg=model_cfg,
+        tasks=tasks,
+    )
+
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    model.to("cpu")
+
+    return model, ckpt
+
+
+@torch.inference_mode()
+def predict_saved_ensemble_streaming(
+    run_dir: Path,
+    manifest: dict,
+    x: np.ndarray,
+    tasks: TaskCatalog,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    fold_files = manifest["ensemble"]["fold_files"]
+    normalize = manifest["config"]["normalize"]
+
+    prob_sum = {task: None for task in tasks.all}
+    fold_preds = []
+
+    for i, fold_file in enumerate(fold_files, start=1):
+        fold_path = Path(run_dir) / fold_file
+        print(f"Predicting fold {i}/{len(fold_files)}: {fold_path.name}")
+
+        model, _ = load_fold_model(fold_path, tasks)
+        model = model.to(device)
+
+        loader = make_loader(
+            x=x,
+            y=None,
+            preprocessor=Preprocessor(normalize),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            device=device,
+        )
+
+        _, _, prob = predict(model, loader, tasks, device)
+        fold_pred = {task: prob[task].argmax(axis=1) for task in tasks.all}
+        fold_preds.append(fold_pred)
+
+        for task in tasks.all:
+            arr = prob[task].astype(np.float64)
+            prob_sum[task] = arr if prob_sum[task] is None else prob_sum[task] + arr
+
+        model.to("cpu")
+        del model
+        clear_cuda()
+
+    ensemble_prob = {task: prob_sum[task] / len(fold_files) for task in tasks.all}
+    ensemble_pred = {task: prob.argmax(axis=1) for task, prob in ensemble_prob.items()}
+
+    return {
+        "y_pred": ensemble_pred,
+        "prob": ensemble_prob,
+        "fold_preds": fold_preds,
+    }
+
+
+def evaluate_saved_ensemble_on_eval_sets(
+    run_dir: Path,
+    manifest: dict,
+    test_df: pl.DataFrame,
+    tasks: TaskCatalog,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    eval_sets = load_eval_sets_from_test_parquet(test_df, tasks)
+    results = {}
+
+    for eval_name, (x_eval, y_eval) in eval_sets.items():
+        print(f"\nEvaluating {eval_name}")
+
+        pred_result = predict_saved_ensemble_streaming(
+            run_dir=run_dir,
+            manifest=manifest,
+            x=x_eval,
+            tasks=tasks,
+            cfg=cfg,
+            device=device,
+        )
+
+        metrics = task_metrics(y_eval, pred_result["y_pred"], tasks)
+        fold_metrics = [
+            task_metrics(y_eval, fold_pred, tasks)
+            for fold_pred in pred_result["fold_preds"]
+        ]
+        fold_summaries = [summarize_metrics(df) for df in fold_metrics]
+        summary = {**summarize_metrics(metrics), **summary_std(fold_summaries)}
+
+        results[eval_name] = {
+            "y_true": y_eval,
+            "y_pred": pred_result["y_pred"],
+            "prob": pred_result["prob"],
+            "fold_preds": pred_result["fold_preds"],
+            "metrics": metrics,
+            "metrics_with_std": task_metrics_with_std(metrics, fold_metrics),
+            "summary": summary,
+            "fold_metrics": fold_metrics,
+            "fold_summaries": fold_summaries,
+        }
+
+    return results
+
+
+def save_evaluation_tables(eval_results: dict, out_dir: Path) -> pl.DataFrame:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows = []
+
+    for eval_name, item in eval_results.items():
+        n = len(next(iter(item["y_true"].values())))
+
+        summary_rows.append(
+            {
+                "eval_name": eval_name,
+                "n_samples": n,
+                **item["summary"],
+            }
+        )
+
+        csv_safe_df(item["metrics"]).write_csv(out_dir / f"{eval_name}_task_metrics.csv")
+        csv_safe_df(item["metrics_with_std"]).write_csv(
+            out_dir / f"{eval_name}_task_metrics_with_std.csv"
+        )
+
+        pl.DataFrame(item["fold_summaries"]).with_columns(
+            pl.Series("fold", list(range(1, len(item["fold_summaries"]) + 1)))
+        ).select(["fold", *item["fold_summaries"][0].keys()]).write_csv(
+            out_dir / f"{eval_name}_fold_summaries.csv"
+        )
+
+    summary_df = pl.DataFrame(summary_rows)
+    summary_df.write_csv(out_dir / "summary.csv")
+
+    return summary_df
+
+
+================================================================================
+File: ./ckan_specnet/data.py
+================================================================================
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+
+from ckan_specnet.core import (
+    COMPONENTS,
+    EVAL_NAME_COL,
+    SAMPLE_ID_COL,
+    SOURCE,
+    SPECTRUM,
+    Config,
+    TaskCatalog,
+)
+
+
+def source_summary(path: Path) -> pl.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    return (
+        pl.scan_parquet(path)
+        .group_by([SOURCE, COMPONENTS])
+        .agg(pl.len().alias("n"))
+        .sort([SOURCE, COMPONENTS])
+        .collect()
+    )
+
+
+def spectrum_hash(value) -> str:
+    arr = np.asarray(value, dtype=np.float32)
+    return hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
+
+
+def add_sample_id(df: pl.DataFrame) -> pl.DataFrame:
+    if SAMPLE_ID_COL in df.columns:
+        return df
+
+    ids = [
+        f"{src}|{comp}|{spectrum_hash(spec)}"
+        for src, comp, spec in zip(
+            df[SOURCE].to_list(),
+            df[COMPONENTS].to_list(),
+            df[SPECTRUM].to_list(),
+            strict=True,
+        )
+    ]
+
+    return df.with_columns(pl.Series(SAMPLE_ID_COL, ids))
+
+
+def load_frame(
+    path: Path,
+    sources: tuple[str, ...],
+    single_component_only: bool,
+    add_id: bool = True,
+) -> pl.DataFrame:
+    query = pl.scan_parquet(path).filter(pl.col(SOURCE).is_in(sources))
+
+    if single_component_only:
+        query = query.filter(pl.col(COMPONENTS) == 1)
+
+    df = query.collect()
+    return add_sample_id(df) if add_id else df
+
+
+def take_rows(df: pl.DataFrame, index: np.ndarray) -> pl.DataFrame:
+    index = np.asarray(index, dtype=np.int64)
+
+    return (
+        df.with_row_index("_row_id")
+        .filter(pl.col("_row_id").is_in(index.tolist()))
+        .drop("_row_id")
+    )
+
+
+def clip_label(df: pl.DataFrame, column: str, upper: int) -> np.ndarray:
+    return np.minimum(df[column].to_numpy(), upper).astype(np.int64)
+
+
+def build_targets(df: pl.DataFrame, tasks: TaskCatalog) -> dict[str, np.ndarray]:
+    base_tasks = set(tasks.binary + tasks.ternary + tasks.quaternary)
+    missing = sorted(task for task in base_tasks if task not in df.columns)
+
+    if missing:
+        raise ValueError(f"Missing task columns: {missing}")
+
+    y = {task: clip_label(df, task, 1) for task in tasks.binary}
+    y |= {f"{task}_3class": clip_label(df, task, 2) for task in tasks.ternary}
+    y |= {f"{task}_4class": clip_label(df, task, 3) for task in tasks.quaternary}
+
+    return y
+
+
+def frame_to_xy(
+    df: pl.DataFrame,
+    tasks: TaskCatalog,
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
+    if df.height == 0:
+        raise ValueError("Empty dataframe.")
+
+    x = np.vstack(df[SPECTRUM].to_list()).astype(np.float32)
+    y = build_targets(df, tasks)
+    sources = df[SOURCE].to_numpy()
+
+    return x, y, sources
+
+
+def take(y: dict[str, np.ndarray], index: np.ndarray) -> dict[str, np.ndarray]:
+    return {task: values[index] for task, values in y.items()}
+
+
+def prepare_or_load_test_parquet(cfg: Config, tasks: TaskCatalog) -> pl.DataFrame:
+    path = cfg.test_parquet
+
+    if path.is_file():
+        test_df = pl.read_parquet(path)
+
+        if EVAL_NAME_COL not in test_df.columns:
+            raise ValueError(f"{path} missing column: {EVAL_NAME_COL}")
+
+        if SAMPLE_ID_COL not in test_df.columns:
+            test_df = add_sample_id(test_df)
+            test_df.write_parquet(path)
+
+        return test_df
+
+    train_candidate_df = load_frame(
+        path=cfg.parquet,
+        sources=cfg.train_sources,
+        single_component_only=cfg.single_component_only,
+        add_id=True,
+    )
+
+    _, _, sources_all = frame_to_xy(train_candidate_df, tasks)
+
+    _, test_idx = train_test_split(
+        np.arange(train_candidate_df.height),
+        test_size=cfg.test_size,
+        random_state=cfg.seed,
+        stratify=sources_all,
+    )
+
+    main_test_df = take_rows(train_candidate_df, test_idx).with_columns(
+        pl.lit("main_test").alias(EVAL_NAME_COL)
+    )
+
+    eval_dfs = [main_test_df]
+
+    for eval_name, sources in cfg.eval_sources.items():
+        df = load_frame(
+            path=cfg.parquet,
+            sources=sources,
+            single_component_only=cfg.single_component_only,
+            add_id=True,
+        )
+
+        if df.height == 0:
+            message = f"Empty eval set: {eval_name}, sources={sources}"
+            if cfg.require_eval_sources:
+                raise RuntimeError(message)
+            continue
+
+        eval_dfs.append(df.with_columns(pl.lit(eval_name).alias(EVAL_NAME_COL)))
+
+    test_df = pl.concat(eval_dfs, how="diagonal_relaxed")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    test_df.write_parquet(path)
+
+    return test_df
+
+
+def load_train_data_excluding_test(
+    cfg: Config,
+    tasks: TaskCatalog,
+    test_df: pl.DataFrame,
+) -> dict:
+    train_candidate_df = load_frame(
+        path=cfg.parquet,
+        sources=cfg.train_sources,
+        single_component_only=cfg.single_component_only,
+        add_id=True,
+    )
+
+    train_df = train_candidate_df.join(
+        test_df.select(SAMPLE_ID_COL).unique(),
+        on=SAMPLE_ID_COL,
+        how="anti",
+    )
+
+    if train_df.height == 0:
+        raise ValueError("Train dataframe is empty after excluding test.parquet.")
+
+    x_train, y_train, train_sources = frame_to_xy(train_df, tasks)
+
+    return {
+        "x_train": x_train,
+        "y_train": y_train,
+        "train_sources": train_sources,
+        "train_df_height": train_df.height,
+    }
+
+
+def load_eval_sets_from_test_parquet(
+    test_df: pl.DataFrame,
+    tasks: TaskCatalog,
+) -> dict[str, tuple[np.ndarray, dict[str, np.ndarray]]]:
+    eval_sets = {}
+
+    for eval_name in sorted(test_df[EVAL_NAME_COL].unique().to_list()):
+        df = test_df.filter(pl.col(EVAL_NAME_COL) == eval_name)
+        x, y, _ = frame_to_xy(df, tasks)
+        eval_sets[eval_name] = (x, y)
+
+    return eval_sets
+
+
+class Preprocessor:
+    def __init__(self, mode: str = "sample_zscore", eps: float = 1e-6):
+        self.mode = mode
+        self.eps = eps
+
+    def fit(self, _: np.ndarray) -> "Preprocessor":
+        return self
+
+    def __call__(self, spectrum: np.ndarray) -> np.ndarray:
+        x = np.asarray(spectrum, dtype=np.float32)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if self.mode == "none":
+            return x.astype(np.float32)
+
+        if self.mode == "sample_zscore":
+            return ((x - x.mean()) / (x.std() + self.eps)).astype(np.float32)
+
+        raise ValueError(f"Unknown normalization: {self.mode}")
+
+
+class SpectraDataset(Dataset):
+    def __init__(
+        self,
+        x: np.ndarray,
+        y: dict[str, np.ndarray] | None,
+        preprocessor: Preprocessor,
+    ):
+        self.x = np.asarray(x, dtype=np.float32)
+        self.y = y
+        self.preprocessor = preprocessor
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, index: int):
+        x = torch.as_tensor(self.preprocessor(self.x[index]), dtype=torch.float32)
+
+        if self.y is None:
+            return x
+
+        y = {
+            task: torch.as_tensor(values[index], dtype=torch.long)
+            for task, values in self.y.items()
+        }
+
+        return x, y
+
+
+def make_loader(
+    x: np.ndarray,
+    y: dict[str, np.ndarray] | None,
+    preprocessor: Preprocessor,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device: torch.device,
+) -> DataLoader:
+    return DataLoader(
+        SpectraDataset(x, y, preprocessor),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+
+================================================================================
+File: ./ckan_specnet/paths.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def cli_path(path: Path, base_dir: Path) -> Path:
+    path = path.expanduser()
+    return path if path.is_absolute() else base_dir / path
+
+
+@dataclass(frozen=True)
+class EvalPaths:
+    test: Path
+    run_dir: Path
+    out: Path
+
+    @classmethod
+    def from_args(cls, args, base_dir: Path) -> "EvalPaths":
+        return cls(
+            test=cli_path(args.test, base_dir),
+            run_dir=cli_path(args.run_dir, base_dir),
+            out=cli_path(args.out, base_dir),
+        )
+
+
+@dataclass(frozen=True)
+class PredictPaths:
+    test: Path
+    run_dir: Path
+    out: Path
+
+    @classmethod
+    def from_args(cls, args, base_dir: Path) -> "PredictPaths":
+        return cls(
+            test=cli_path(args.test, base_dir),
+            run_dir=cli_path(args.run_dir, base_dir),
+            out=cli_path(args.out, base_dir),
+        )
+
+
+@dataclass(frozen=True)
+class PlotPaths:
+    test: Path
+    run_dir: Path
+    out: Path
+
+    @classmethod
+    def from_args(cls, args, base_dir: Path) -> "PlotPaths":
+        return cls(
+            test=cli_path(args.test, base_dir),
+            run_dir=cli_path(args.run_dir, base_dir),
+            out=cli_path(args.out, base_dir),
+        )
+
+
+@dataclass(frozen=True)
+class TrainPaths:
+    parquet: Path
+    test: Path
+    out: Path
+
+    @classmethod
+    def from_args(cls, args, base_dir: Path) -> "TrainPaths":
+        return cls(
+            parquet=cli_path(args.parquet, base_dir),
+            test=cli_path(args.test, base_dir),
+            out=cli_path(args.out, base_dir),
+        )
+
+
+@dataclass(frozen=True)
+class DigitizePaths:
+    input: Path
+    out: Path
+
+    @classmethod
+    def from_args(cls, args, base_dir: Path) -> "DigitizePaths":
+        return cls(
+            input=cli_path(args.input, base_dir),
+            out=cli_path(args.out, base_dir),
+        )
+
+
+================================================================================
+File: ./ckan_specnet/model.py
+================================================================================
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ikan.KAN import KAN
+
+from ckan_specnet.core import ModelConfig, TaskCatalog
+
+
+def activation(name: str) -> nn.Module:
+    return {
+        "relu": nn.ReLU,
+        "mish": nn.Mish,
+        "silu": nn.SiLU,
+        "gelu": nn.GELU,
+    }.get(name.lower(), nn.ReLU)()
+
+
+def enable_kan_speed(module: nn.Module) -> None:
+    for submodule in module.modules():
+        speed = getattr(submodule, "speed", None)
+        if callable(speed):
+            speed()
+
+
+class ECA(nn.Module):
+    def __init__(self, channels: int, b: int = 1, g: int = 2):
+        super().__init__()
+        kernel = int(abs((math.log2(channels) + b) / g))
+        kernel = kernel if kernel % 2 else kernel + 1
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel, padding=kernel // 2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.adaptive_avg_pool1d(x, 1).squeeze(-1).unsqueeze(1)
+        y = torch.sigmoid(self.conv(y)).squeeze(1).unsqueeze(-1)
+        return x * y
+
+
+class Backbone(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+
+        layers = []
+        in_channels = 1
+
+        for i, (out_channels, kernel) in enumerate(
+            zip(cfg.conv_channels, cfg.conv_kernels, strict=True)
+        ):
+            layers += [
+                nn.Conv1d(in_channels, out_channels, kernel),
+                nn.BatchNorm1d(out_channels),
+                activation(cfg.act_name),
+            ]
+
+            if cfg.pool_sizes[i]:
+                layers.append(nn.AvgPool1d(cfg.pool_sizes[i], cfg.pool_sizes[i]))
+
+            if i in cfg.eca_positions:
+                layers.append(ECA(out_channels))
+
+            in_channels = out_channels
+
+        self.net = nn.Sequential(*layers)
+        self.out_channels = cfg.conv_channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x.unsqueeze(1) if x.dim() == 2 else x)
+
+
+class GlobalHead(nn.Module):
+    def __init__(self, cfg: ModelConfig, channels: int):
+        super().__init__()
+
+        self.mode = cfg.adaptive_pool_mode
+        self.avg = nn.AdaptiveAvgPool1d(cfg.adaptive_pool_size)
+        self.max = nn.AdaptiveMaxPool1d(cfg.adaptive_pool_size)
+
+        width = channels * cfg.adaptive_pool_size
+        width *= 2 if self.mode == "avgmax" else 1
+
+        self.proj = nn.Sequential(
+            nn.Linear(width, cfg.fc_hidden),
+            nn.BatchNorm1d(cfg.fc_hidden),
+            activation(cfg.act_name),
+            nn.Dropout(cfg.dropout_fc),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "avgmax":
+            x = torch.cat([self.avg(x).flatten(1), self.max(x).flatten(1)], dim=1)
+        else:
+            x = self.avg(x).flatten(1)
+
+        return self.proj(x)
+
+
+def task_heads(cfg: ModelConfig, tasks: TaskCatalog) -> nn.ModuleDict:
+    return nn.ModuleDict(
+        {
+            task: nn.Sequential(
+                nn.Linear(cfg.fc_hidden, cfg.head_hidden),
+                activation(cfg.act_name),
+                nn.Dropout(cfg.dropout_head),
+                nn.Linear(cfg.head_hidden, n_classes),
+            )
+            for task, n_classes in tasks.num_classes.items()
+        }
+    )
+
+
+class CNN(nn.Module):
+    def __init__(self, input_size: int, cfg: ModelConfig, tasks: TaskCatalog):
+        super().__init__()
+        self.tasks = tasks
+        self.backbone = Backbone(cfg)
+        self.global_head = GlobalHead(cfg, self.backbone.out_channels)
+        self.heads = task_heads(cfg, tasks)
+
+    def forward(self, x: torch.Tensor, **_) -> dict[str, torch.Tensor]:
+        z = self.global_head(self.backbone(x))
+        return {task: self.heads[task](z) for task in self.tasks.all}
+
+
+class ContributionKAN(nn.Module):
+    def __init__(self, input_size: int, cfg: ModelConfig, tasks: TaskCatalog):
+        super().__init__()
+
+        self.input_size = input_size
+        self.cfg = cfg
+        self.tasks = tasks
+        self.num_basis = cfg.contrib_num_basis
+
+        self.register_buffer(
+            "coord",
+            torch.linspace(-1.0, 1.0, input_size).view(input_size, 1),
+            persistent=False,
+        )
+
+        self.coord_kan = KAN(
+            layers_hidden=[1, cfg.contrib_hidden, cfg.contrib_num_basis],
+            grid_size=cfg.kan_grid_size,
+            spline_order=cfg.kan_spline_order,
+            scale_noise=cfg.kan_scale_noise,
+            scale_base=cfg.kan_scale_base,
+            scale_spline=cfg.kan_scale_spline,
+            base_activation=nn.SiLU,
+            grid_eps=cfg.kan_grid_eps,
+            grid_range=cfg.kan_grid_range,
+        )
+
+        self.coeff = nn.ModuleDict(
+            {
+                task: nn.Linear(cfg.fc_hidden, n_classes * cfg.contrib_num_basis)
+                for task, n_classes in tasks.num_classes.items()
+            }
+        )
+
+        self.bias = nn.ModuleDict(
+            {
+                task: nn.Linear(cfg.fc_hidden, n_classes)
+                for task, n_classes in tasks.num_classes.items()
+            }
+        )
+
+        self.alpha = nn.ParameterDict(
+            {
+                task: nn.Parameter(torch.tensor(cfg.contrib_alpha_init))
+                for task in tasks.all
+            }
+        )
+
+        self.reset_parameters(cfg.contrib_init_std)
+        self._laplacian_loss: torch.Tensor | None = None
+        enable_kan_speed(self)
+
+    def reset_parameters(self, std: float) -> None:
+        for layer in self.coeff.values():
+            nn.init.normal_(layer.weight, mean=0.0, std=std)
+            nn.init.zeros_(layer.bias)
+
+        for layer in self.bias.values():
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def basis(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        phi = self.coord_kan(self.coord.to(device=device, dtype=torch.float32))
+        phi = (phi - phi.mean(0, keepdim=True)) / (phi.std(0, keepdim=True) + 1e-6)
+        return phi.to(dtype=dtype)
+
+    def signal(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.squeeze(1) if x.dim() == 3 else x
+
+        if not self.cfg.contrib_signal_norm:
+            return x
+
+        return (x - x.mean(1, keepdim=True)) / (x.std(1, keepdim=True) + 1e-6)
+
+    @staticmethod
+    def laplacian_1d_loss(weight: torch.Tensor) -> torch.Tensor:
+        if weight.shape[-1] < 3:
+            return weight.new_tensor(0.0)
+
+        lap = weight[:, :, 2:] - 2.0 * weight[:, :, 1:-1] + weight[:, :, :-2]
+        return lap.pow(2).mean()
+
+    def regularization_loss(self) -> torch.Tensor:
+        lam = float(getattr(self.cfg, "contrib_lap_lambda", 0.0))
+
+        if lam <= 0 or self._laplacian_loss is None:
+            return self.coord.new_tensor(0.0)
+
+        return lam * self._laplacian_loss
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        return_contrib: bool = False,
+    ):
+        x = self.signal(x)
+        batch_size, length = x.shape
+
+        if length != self.input_size:
+            raise ValueError(f"Expected input length {self.input_size}, got {length}")
+
+        phi = self.basis(z.dtype, z.device)
+        signal_basis = torch.matmul(x.to(z.dtype), phi) / length
+
+        logits = {}
+        contrib = {} if return_contrib else None
+
+        self._laplacian_loss = None
+        lap_losses = []
+
+        use_laplacian = (
+            self.training
+            and float(getattr(self.cfg, "contrib_lap_lambda", 0.0)) > 0
+            and getattr(self.cfg, "contrib_lap_on", "weight") == "weight"
+        )
+
+        for task in self.tasks.all:
+            n_classes = self.tasks.num_classes[task]
+            coeff = self.coeff[task](z).view(batch_size, n_classes, self.num_basis)
+
+            delta = torch.einsum("bcr,br->bc", coeff, signal_basis)
+            delta = delta + self.bias[task](z)
+            logits[task] = self.alpha[task].to(delta.dtype) * delta
+
+            if return_contrib or use_laplacian:
+                weight = torch.einsum("bcr,lr->bcl", coeff, phi)
+
+                if use_laplacian:
+                    lap_losses.append(self.laplacian_1d_loss(weight))
+
+                if return_contrib:
+                    contrib[task] = (
+                        self.alpha[task].to(weight.dtype)
+                        * weight
+                        * x.to(weight.dtype).unsqueeze(1)
+                        / length
+                    )
+
+        self._laplacian_loss = (
+            torch.stack(lap_losses).mean() if lap_losses else x.new_tensor(0.0)
+        )
+
+        return (logits, contrib) if return_contrib else logits
+
+
+class CNNContributionKAN(nn.Module):
+    def __init__(self, input_size: int, cfg: ModelConfig, tasks: TaskCatalog):
+        super().__init__()
+        self.tasks = tasks
+        self.backbone = Backbone(cfg)
+        self.global_head = GlobalHead(cfg, self.backbone.out_channels)
+        self.base_heads = task_heads(cfg, tasks)
+        self.contrib = ContributionKAN(input_size, cfg, tasks)
+
+    def regularization_loss(self) -> torch.Tensor:
+        return self.contrib.regularization_loss()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_contrib: bool = False,
+        logit_mode: str = "full",
+    ):
+        z = self.global_head(self.backbone(x))
+        base = {task: self.base_heads[task](z) for task in self.tasks.all}
+
+        if logit_mode == "base":
+            return (base, None) if return_contrib else base
+
+        if return_contrib:
+            delta, contrib = self.contrib(x, z, return_contrib=True)
+        else:
+            delta = self.contrib(x, z)
+            contrib = None
+
+        if logit_mode == "delta":
+            return (delta, contrib) if return_contrib else delta
+
+        if logit_mode != "full":
+            raise ValueError(f"Unknown logit_mode: {logit_mode}")
+
+        out = {task: base[task] + delta[task] for task in self.tasks.all}
+        return (out, contrib) if return_contrib else out
+
+
+def build_model(input_size: int, cfg: ModelConfig, tasks: TaskCatalog) -> nn.Module:
+    if cfg.model_name == "cnn":
+        return CNN(input_size, cfg, tasks)
+
+    if cfg.model_name == "cnn_contrib_kan":
+        return CNNContributionKAN(input_size, cfg, tasks)
+
+    raise ValueError(f"Unknown model_name: {cfg.model_name}")
+
+
+================================================================================
+File: ./README.md
+================================================================================
+
+# CKAN-SpecNet
+
+CKAN-SpecNet is an interpretable multi-task model for IR spectral functional-group analysis. It predicts both functional-group presence and coarse-grained count levels.
+
+The KAN component and transition-evidence visualization are used to support model interpretation by checking whether predictions rely on chemically meaningful IR spectral regions.
+
+
+
+## Installation
+
+```bash
+uv sync
+```
+
+For digitization utilities:
+
+```bash
+uv sync --extra digitization
+```
+
+## Required Files
+
+The public test set and released five-fold model files can be downloaded from Google Drive:
+
+https://drive.google.com/drive/folders/1IC4L3ZADsPZVhuhMxcmgmN8wykg2d1Wk?usp=drive_link
+
+After downloading, place the public test set at:
+
+```text
+data/test.parquet
+```
+
+Place the model files under:
+
+```text
+models/ckan_specnet_5fold/
+  manifest.json
+  fold_1.pt
+  fold_2.pt
+  fold_3.pt
+  fold_4.pt
+  fold_5.pt
+```
+
+`manifest.json` stores the model configuration, task definition, input length, normalization mode, and fold model filenames.
+
+
+## Data Sources
+
+The data used in this study were collected from:
+
+- NIST Chemistry WebBook: https://webbook.nist.gov/chemistry/
+- SDBS: https://sdbs.db.aist.go.jp
+- SDBS acquisition method adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
+- SWGDRUG: https://www.swgdrug.org
+
+The released `test.parquet` also contains digitized spectra from commercial instrument exports.
+
+Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `test.parquet` is provided for direct evaluation reproduction.
+
+## Visual Examples
+
+### Transition Evidence
+
+Transition-evidence plots highlight spectral regions supporting class transitions in functional-group predictions.
+
+<p align="center">
+  <img src="assets/alcohols_C0_to_C1.png" alt="Alcohols C0 to C1" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/alcohols_C1_to_C2.png" alt="Alcohols C1 to C2" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/alcohols_C2_to_C3.png" alt="Alcohols C2 to C3" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/ketones_C0_to_C1.png" alt="Ketones C0 to C1" width="70%">
+</p>
+
+### Spectrum Digitization
+
+<p align="center">
+  <img src="assets/example.gif" alt="Digitization example" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/digitize.png" alt="Digitized spectrum" width="70%">
+</p>
+
+## Test Set
+
+`data/test.parquet` is the fixed public evaluation set. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
+
+Evaluation subsets are distinguished by `_eval_name`:
+
+```text
+main_test        held-out NIST/SDBS pure-compound spectra
+swgdrug          independent external FTIR-ATR spectra
+xps_digitized    digitized external spectra from instrument-exported files
+```
+
+The original data source of each row is stored in `source_name`:
+
+```text
+sdbs             SDBS spectra
+nist_gas         NIST gas-phase IR spectra
+swgdrug          SWGDRUG spectra
+xps_digitized    digitized external spectra
+```
+
+`main_test` comes from the model-development sources and consists of NIST gas-phase IR and SDBS spectra. During training reproduction, samples in `test.parquet` are excluded by `_sample_id`.
+
+`swgdrug` and the digitized external spectra are not used for training and are only used for external robustness evaluation.
+
+All spectra are represented on a unified IR grid.
+
+Main fields:
+
+```text
+spectrum          preprocessed IR spectrum vector
+source_name       original data source
+source_record_id  original source record identifier
+source_path       local source path or generated source path
+compound_name     compound name when available
+smiles            SMILES
+component_count   number of molecular components
+_eval_name        evaluation subset name
+_sample_id        unique sample identifier
+label columns     functional-group presence/count labels
+```
+
+The label columns include binary functional-group presence labels and coarse-grained count labels, such as `_3class` and `_4class` tasks.
+
+## Evaluation
+
+```bash
+uv run python scripts/evaluate.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --out results/reproduce
+```
+
+The output directory contains `summary.csv`, per-task metrics, and fold summaries for each evaluation subset.
+
+```bash
+uv run python scripts/evaluate.py --help
+```
+
+## Single-Sample Prediction
+
+```bash
+uv run python scripts/predict.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --sample-index 0 --out results/sample0_prediction.csv
+```
+
+```bash
+uv run python scripts/predict.py --help
+```
+
+## Interpretability
+
+Transition-evidence visualization highlights spectral regions that support a transition between functional-group classes or count levels. It is not a deterministic structural assignment, but a diagnostic plot for checking whether the model relies on reasonable IR regions.
+
+Automatically select a correctly predicted sample from a target class and save figures to `results/`:
+
+```bash
+uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task alcohols_4class --class-id 3 --rank 1 --out results/transition_evidence/alcohols_4class
+```
+
+Use a specific sample:
+
+```bash
+uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task ketones --sample-index 6636 --out results/transition_evidence/sample6636_ketones
+```
+
+```bash
+uv run python scripts/plot_transition_evidence.py --help
+```
+
+## Digitization
+
+The digitization utility converts an IR spectrum image into a numerical spectrum. Axis tick labels are recognized with `python-doctr`, and the extracted curve is saved together with diagnostic figures.
+
+Convert a spectral image into a numerical spectrum:
+
+```bash
+uv run python scripts/digitize.py --input examples/example1.png --out results/digitize_example
+```
+
+Outputs:
+
+```text
+results/digitize_example/
+  digitized_spectrum.csv
+  spectrum.png
+  axis_debug.png
+```
+
+Supported image inputs include common formats such as PNG, JPG, JPEG, BMP, TIFF, WEBP, and GIF.
+
+```bash
+uv run python scripts/digitize.py --help
+```
+
+## Training
+
+```bash
+uv run python scripts/train.py --parquet data/unified.parquet --test data/test.parquet --out results/new_run
+```
+
+Samples in `test.parquet` are excluded during training.
+
+```bash
+uv run python scripts/train.py --help
+```
+
+## Repository Layout
+
+```text
+ckan_specnet/
+  core.py
+  data.py
+  model.py
+  eval.py
+  plot.py
+
+scripts/
+  evaluate.py
+  predict.py
+  plot_transition_evidence.py
+  train.py
+  digitize.py
+
+data/
+  test.parquet
+
+models/
+  ckan_specnet_5fold/
+
+examples/
+assets/
+results/
+```

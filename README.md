@@ -4,8 +4,6 @@ CKAN-SpecNet is an interpretable multi-task model for IR spectral functional-gro
 
 The KAN component and transition-evidence visualization are used to support model interpretation by checking whether predictions rely on chemically meaningful IR spectral regions.
 
-
-
 ## Installation
 
 ```bash
@@ -43,7 +41,6 @@ models/ckan_specnet_5fold/
 ```
 
 `manifest.json` stores the model configuration, task definition, input length, normalization mode, and fold model filenames.
-
 
 ## Data Sources
 
@@ -136,11 +133,52 @@ The label columns include binary functional-group presence labels and coarse-gra
 
 ## Evaluation
 
+Run the released five-fold ensemble on the public test set:
+
 ```bash
 uv run python scripts/evaluate.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --out results/reproduce
 ```
 
-The output directory contains `summary.csv`, per-task metrics, and fold summaries for each evaluation subset.
+The evaluation reports will be saved under:
+
+```text
+results/reproduce/
+```
+
+The output directory contains:
+
+```text
+summary.csv
+
+main_test_task_metrics.csv
+main_test_task_metrics_with_std.csv
+main_test_fold_summaries.csv
+
+swgdrug_task_metrics.csv
+swgdrug_task_metrics_with_std.csv
+swgdrug_fold_summaries.csv
+
+xps_digitized_task_metrics.csv
+xps_digitized_task_metrics_with_std.csv
+xps_digitized_fold_summaries.csv
+```
+
+Report files:
+
+```text
+summary.csv                    overall metrics for each evaluation subset
+*_task_metrics.csv             per-task metrics
+*_task_metrics_with_std.csv    per-task metrics with fold-level standard deviation
+*_fold_summaries.csv           fold-level summary metrics
+```
+
+Evaluation subsets:
+
+```text
+main_test        held-out NIST/SDBS pure-compound spectra
+swgdrug          independent external FTIR-ATR spectra
+xps_digitized    digitized external spectra from instrument-exported files
+```
 
 ```bash
 uv run python scripts/evaluate.py --help
@@ -151,6 +189,8 @@ uv run python scripts/evaluate.py --help
 ```bash
 uv run python scripts/predict.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --sample-index 0 --out results/sample0_prediction.csv
 ```
+
+The output CSV contains the true class, predicted class, predicted label, probability, and correctness for each task.
 
 ```bash
 uv run python scripts/predict.py --help
