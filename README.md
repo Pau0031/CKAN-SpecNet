@@ -42,56 +42,48 @@ models/ckan_specnet_5fold/
 
 `manifest.json` stores the model configuration, task definition, input length, normalization mode, and fold model filenames.
 
-## Data Sources
+## Evaluation
 
-The data used in this study were collected from:
+Run the released five-fold ensemble on the public test set:
 
-- NIST Chemistry WebBook: https://webbook.nist.gov/chemistry/
-- SDBS: https://sdbs.db.aist.go.jp
-- SDBS acquisition method adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
-- SWGDRUG: https://www.swgdrug.org
+```bash
+uv run python scripts/evaluate.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --out results/reproduce
+```
 
-The released `test.parquet` also contains digitized spectra from commercial instrument exports.
+The evaluation reports will be saved under:
 
-Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `test.parquet` is provided for direct evaluation reproduction.
+```text
+results/reproduce/
+```
 
-## Visual Examples
+The output directory contains:
 
-### Transition Evidence
+```text
+summary.csv
 
-Transition-evidence plots highlight spectral regions supporting class transitions in functional-group predictions.
+main_test_task_metrics.csv
+main_test_task_metrics_with_std.csv
+main_test_fold_summaries.csv
 
-<p align="center">
-  <img src="assets/alcohols_C0_to_C1.png" alt="Alcohols C0 to C1" width="70%">
-</p>
+swgdrug_task_metrics.csv
+swgdrug_task_metrics_with_std.csv
+swgdrug_fold_summaries.csv
 
-<p align="center">
-  <img src="assets/alcohols_C1_to_C2.png" alt="Alcohols C1 to C2" width="70%">
-</p>
+xps_digitized_task_metrics.csv
+xps_digitized_task_metrics_with_std.csv
+xps_digitized_fold_summaries.csv
+```
 
-<p align="center">
-  <img src="assets/alcohols_C2_to_C3.png" alt="Alcohols C2 to C3" width="70%">
-</p>
+Report files:
 
-<p align="center">
-  <img src="assets/ketones_C0_to_C1.png" alt="Ketones C0 to C1" width="70%">
-</p>
+```text
+summary.csv                    overall metrics for each evaluation subset
+*_task_metrics.csv             per-task metrics
+*_task_metrics_with_std.csv    per-task metrics with fold-level standard deviation
+*_fold_summaries.csv           fold-level summary metrics
+```
 
-### Spectrum Digitization
-
-<p align="center">
-  <img src="assets/example.gif" alt="Digitization example" width="70%">
-</p>
-
-<p align="center">
-  <img src="assets/digitize.png" alt="Digitized spectrum" width="70%">
-</p>
-
-## Test Set
-
-`data/test.parquet` is the fixed public evaluation set. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
-
-Evaluation subsets are distinguished by `_eval_name`:
+Evaluation subsets:
 
 ```text
 main_test        held-out NIST/SDBS pure-compound spectra
@@ -99,35 +91,41 @@ swgdrug          independent external FTIR-ATR spectra
 xps_digitized    digitized external spectra from instrument-exported files
 ```
 
-The original data source of each row is stored in `source_name`:
-
-```text
-sdbs             SDBS spectra
-nist_gas         NIST gas-phase IR spectra
-swgdrug          SWGDRUG spectra
-xps_digitized    digitized external spectra
+```bash
+uv run python scripts/evaluate.py --help
 ```
 
-`main_test` comes from the model-development sources and consists of NIST gas-phase IR and SDBS spectra. During training reproduction, samples in `test.parquet` are excluded by `_sample_id`.
+## Single-Sample Prediction
 
-`swgdrug` and the digitized external spectra are not used for training and are only used for external robustness evaluation.
-
-Main fields:
-
-```text
-spectrum          preprocessed IR spectrum vector
-source_name       original data source
-source_record_id  original source record identifier
-source_path       local source path or generated source path
-compound_name     compound name when available
-smiles            SMILES
-component_count   number of molecular components
-_eval_name        evaluation subset name
-_sample_id        unique sample identifier
-label columns     functional-group presence/count labels
+```bash
+uv run python scripts/predict.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --sample-index 0 --out results/sample0_prediction.csv
 ```
 
-The label columns include binary functional-group presence labels and coarse-grained count labels, such as `_3class` and `_4class` tasks.
+The output CSV contains the true class, predicted class, predicted label, probability, and correctness for each task.
+
+```bash
+uv run python scripts/predict.py --help
+```
+
+## Interpretability
+
+Transition-evidence visualization highlights spectral regions that support a transition between functional-group classes or count levels. It is not a deterministic structural assignment, but a diagnostic plot for checking whether the model relies on reasonable IR regions.
+
+Automatically select a correctly predicted sample from a target class and save figures to `results/`:
+
+```bash
+uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task alcohols_4class --class-id 3 --rank 1 --out results/transition_evidence/alcohols_4class
+```
+
+Use a specific sample:
+
+```bash
+uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task ketones --sample-index 6636 --out results/transition_evidence/sample6636_ketones
+```
+
+```bash
+uv run python scripts/plot_transition_evidence.py --help
+```
 
 ## Custom Test Data Format
 
@@ -244,146 +242,10 @@ amines
 carbonyl_oxygen
 ```
 
-A minimal example for creating a compatible Parquet file:
-
-```python
-from pathlib import Path
-
-import polars as pl
-
-label_columns = [
-    "alkane",
-    "alkene",
-    "alkyne",
-    "aromatics",
-    "esters",
-    "ketones",
-    "ortho",
-    "meta",
-    "para",
-    "alkyl_halides",
-    "alcohols",
-    "ether",
-    "amines",
-    "carbonyl_oxygen",
-    "aldehydes",
-    "acyl_halides",
-    "amides",
-    "nitriles",
-    "nitro",
-    "isocyanate",
-    "isothiocyanate",
-]
-
-spectrum = []  # TODO: use a spectrum vector compatible with data/test.parquet
-
-row = {
-    "spectrum": spectrum,
-    "source_name": "custom",
-    "source_record_id": "custom_0001",
-    "source_path": "custom/custom_0001",
-    "compound_name": "example compound",
-    "smiles": "",
-    "component_count": 1,
-    "_eval_name": "custom_test",
-    "_sample_id": "custom|custom_0001",
-    **{column: 0 for column in label_columns},
-}
-
-df = pl.DataFrame([row])
-Path("data").mkdir(exist_ok=True)
-df.write_parquet("data/custom_test.parquet")
-```
-
-Evaluate the custom file with the released models:
+Evaluate a custom file with the released models:
 
 ```bash
 uv run python scripts/evaluate.py --test data/custom_test.parquet --run-dir models/ckan_specnet_5fold --out results/custom_test
-```
-
-## Evaluation
-
-Run the released five-fold ensemble on the public test set:
-
-```bash
-uv run python scripts/evaluate.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --out results/reproduce
-```
-
-The evaluation reports will be saved under:
-
-```text
-results/reproduce/
-```
-
-The output directory contains:
-
-```text
-summary.csv
-
-main_test_task_metrics.csv
-main_test_task_metrics_with_std.csv
-main_test_fold_summaries.csv
-
-swgdrug_task_metrics.csv
-swgdrug_task_metrics_with_std.csv
-swgdrug_fold_summaries.csv
-
-xps_digitized_task_metrics.csv
-xps_digitized_task_metrics_with_std.csv
-xps_digitized_fold_summaries.csv
-```
-
-Report files:
-
-```text
-summary.csv                    overall metrics for each evaluation subset
-*_task_metrics.csv             per-task metrics
-*_task_metrics_with_std.csv    per-task metrics with fold-level standard deviation
-*_fold_summaries.csv           fold-level summary metrics
-```
-
-Evaluation subsets:
-
-```text
-main_test        held-out NIST/SDBS pure-compound spectra
-swgdrug          independent external FTIR-ATR spectra
-xps_digitized    digitized external spectra from instrument-exported files
-```
-
-```bash
-uv run python scripts/evaluate.py --help
-```
-
-## Single-Sample Prediction
-
-```bash
-uv run python scripts/predict.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --sample-index 0 --out results/sample0_prediction.csv
-```
-
-The output CSV contains the true class, predicted class, predicted label, probability, and correctness for each task.
-
-```bash
-uv run python scripts/predict.py --help
-```
-
-## Interpretability
-
-Transition-evidence visualization highlights spectral regions that support a transition between functional-group classes or count levels. It is not a deterministic structural assignment, but a diagnostic plot for checking whether the model relies on reasonable IR regions.
-
-Automatically select a correctly predicted sample from a target class and save figures to `results/`:
-
-```bash
-uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task alcohols_4class --class-id 3 --rank 1 --out results/transition_evidence/alcohols_4class
-```
-
-Use a specific sample:
-
-```bash
-uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models/ckan_specnet_5fold --eval-name main_test --task ketones --sample-index 6636 --out results/transition_evidence/sample6636_ketones
-```
-
-```bash
-uv run python scripts/plot_transition_evidence.py --help
 ```
 
 ## Digitization
@@ -410,6 +272,93 @@ Supported image inputs include common formats such as PNG, JPG, JPEG, BMP, TIFF,
 ```bash
 uv run python scripts/digitize.py --help
 ```
+
+## Test Set
+
+`data/test.parquet` is the fixed public evaluation set. It contains spectra, SMILES, labels, source information, and evaluation subset identifiers.
+
+Evaluation subsets are distinguished by `_eval_name`:
+
+```text
+main_test        held-out NIST/SDBS pure-compound spectra
+swgdrug          independent external FTIR-ATR spectra
+xps_digitized    digitized external spectra from instrument-exported files
+```
+
+The original data source of each row is stored in `source_name`:
+
+```text
+sdbs             SDBS spectra
+nist_gas         NIST gas-phase IR spectra
+swgdrug          SWGDRUG spectra
+xps_digitized    digitized external spectra
+```
+
+`main_test` comes from the model-development sources and consists of NIST gas-phase IR and SDBS spectra. During training reproduction, samples in `test.parquet` are excluded by `_sample_id`.
+
+`swgdrug` and the digitized external spectra are not used for training and are only used for external robustness evaluation.
+
+Main fields:
+
+```text
+spectrum          preprocessed IR spectrum vector
+source_name       original data source
+source_record_id  original source record identifier
+source_path       local source path or generated source path
+compound_name     compound name when available
+smiles            SMILES
+component_count   number of molecular components
+_eval_name        evaluation subset name
+_sample_id        unique sample identifier
+label columns     functional-group presence/count labels
+```
+
+The label columns include binary functional-group presence labels and coarse-grained count labels, such as `_3class` and `_4class` tasks.
+
+## Visual Examples
+
+### Transition Evidence
+
+Transition-evidence plots highlight spectral regions supporting class transitions in functional-group predictions.
+
+<p align="center">
+  <img src="assets/alcohols_C0_to_C1.png" alt="Alcohols C0 to C1" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/alcohols_C1_to_C2.png" alt="Alcohols C1 to C2" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/alcohols_C2_to_C3.png" alt="Alcohols C2 to C3" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/ketones_C0_to_C1.png" alt="Ketones C0 to C1" width="70%">
+</p>
+
+### Spectrum Digitization
+
+<p align="center">
+  <img src="assets/example.gif" alt="Digitization example" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/digitize.png" alt="Digitized spectrum" width="70%">
+</p>
+
+## Data Sources
+
+The data used in this study were collected from:
+
+- NIST Chemistry WebBook: https://webbook.nist.gov/chemistry/
+- SDBS: https://sdbs.db.aist.go.jp
+- SDBS acquisition method adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
+- SWGDRUG: https://www.swgdrug.org
+
+The released `test.parquet` also contains digitized spectra from commercial instrument exports.
+
+Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `test.parquet` is provided for direct evaluation reproduction.
 
 ## Training
 
