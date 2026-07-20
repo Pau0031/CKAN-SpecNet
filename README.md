@@ -344,6 +344,7 @@ scripts/
   plot_transition_evidence.py
   train.py
   digitize.py
+  compute_enrichment.py
 
 data/
   test.parquet
