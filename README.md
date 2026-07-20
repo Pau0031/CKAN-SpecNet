@@ -126,7 +126,74 @@ uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run
 ```bash
 uv run python scripts/plot_transition_evidence.py --help
 ```
+## Functional Group Enrichment Factor Calculation
+This script quantifies the **chemical interpretability** of CKAN-SpecNet by calculating enrichment factors for all 21 functional group classification tasks.
 
+### Core Definition
+Enrichment factor quantifies whether model predictive evidence concentrates within chemically characteristic IR bands of each functional group:
+$$
+\text{Enrichment} = \frac{\text{Fraction of total transition evidence falling inside target IR regions}}{\text{Fraction of full spectral axis covered by target IR regions}}
+$$
+- Enrichment > 1: Model predictive signals are enriched in chemically meaningful wavenumber ranges (desirable, physically consistent behavior).
+- Enrichment ≤ 1: Model evidence is uniformly distributed or biased toward irrelevant spectral noise.
+
+### Key Workflow
+1. Predefined characteristic IR wavenumber ranges for each functional group (parsed from the reference IR peak table).
+2. Load the 5-fold ensemble model and run inference on held-out test data.
+3. For each functional group and every class transition (binary: C0→C1; ternary: C0→C1, C1→C2; quaternary: C0→C1, C1→C2, C2→C3):
+   - Sample top-confident correctly predicted spectra for the target class.
+   - Extract KAN transition evidence curves for each valid sample.
+   - Compute two core metrics:
+     1. `Evidence within regions (%)`: Percentage of total predictive signal located in functional-group-specific IR bands.
+     2. `Spectral-axis coverage (%)`: Percentage of the full input spectrum occupied by the target IR bands.
+   - Derive average enrichment factor across all valid samples for each transition.
+4. Export aggregated statistics to CSV for supplementary analysis and manuscript plotting.
+
+### Execution Command
+```bash
+uv run python scripts/calc_enrichment.py \
+    --test data/test.parquet \
+    --run-dir models/ckan_specnet_5fold \
+    --eval-name main_test \
+    --n-samples 10 \
+    --smooth-window 15 \
+    --out results/enrichment_result.csv
+```
+
+### Argument Explanation
+| Argument | Description |
+|----------|-------------|
+| `--test` | Path to released evaluation parquet file |
+| `--run-dir` | Root directory storing 5-fold ensemble model weights and manifest.json |
+| `--eval-name` | Target evaluation subset (`main_test` / `swgdrug` / `xps_digitized`) |
+| `--n-samples` | Maximum top-confidence correctly predicted samples per class transition |
+| `--smooth-window` | Smoothing window width for raw transition evidence curves |
+| `--out` | Output CSV path for enrichment factor statistics |
+| `--batch-size` | Inference batch size for ensemble prediction |
+| `--num-workers` | Dataloader worker count, set to 0 for Windows/Jupyter compatibility |
+
+### Output CSV Columns
+```text
+Functional group          Human-readable functional group
+Transition                Class transition pair (C0→C1 / C1→C2 / C2→C3)
+Chemically relevant regions  Concatenated characteristic IR wavenumber ranges
+Spectral-axis coverage (%)  Fraction of full spectrum covered by target IR bands
+Evidence within regions (%) Mean fraction of model predictive signal inside target IR bands
+Enrichment                Average enrichment factor across valid samples
+N samples                 Count of valid samples used for averaging
+```
+
+### Help Command
+```bash
+uv run python scripts/calc_enrichment.py --help
+```
+
+### Reference for Functional Group IR Ranges
+The predefined characteristic infrared wavenumber ranges hardcoded in this script are extracted from the authoritative monograph *Infrared and Raman Characteristic Group Frequencies*. This textbook serves as the standard empirical reference for vibrational spectral data, featuring complete tables of peak positions, band intensity labels and vibration mode assignments for organic, inorganic and coordination functional groups.
+
+For full spectral assignment details, extended frequency tables and structural correlation rules, readers may consult the corresponding chapters and charts in the original publication.
+
+Note that minor discrepancies may exist in the script’s wavenumber intervals due to manual transcription and reorganization during code development. If inconsistent band ranges are found, please refer back to the original book for accurate values, modify the wavenumber tuples inside the script, and re-execute the calculation accordingly.
 ## Digitization
 
 The digitization utility converts an IR spectrum image into a numerical spectrum. Axis tick labels are recognized with `python-doctr`, and the extracted curve is saved together with diagnostic figures.
