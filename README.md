@@ -307,6 +307,14 @@ The data used in this study were collected from:
 The released `data/test.parquet` also contains digitized spectra from commercial instrument exports.
 
 Some raw data are not redistributed in this repository because the original databases, web materials, instrument-exported files, or additionally collected materials may have their own access, licensing, or redistribution restrictions. The released `data/test.parquet` is provided for direct evaluation reproduction.
+## Dataset Molecular Descriptor Distribution Analysis
+Notebook path: `scripts/samples/Dataset_Molecular_Descriptor_Distribution_Analysis.ipynb`
+
+Analyzes molecular weight and heavy atom distribution for the full 35,327-compound dataset using RDKit. Generates statistics and distribution plots for supplementary figures.
+
+### Environment
+Dependencies: polars, pandas, rdkit, matplotlib, seaborn
+Install via Conda/pip/uv, launch after activating your environment
 
 ## Training
 
@@ -344,6 +352,8 @@ models/
   ckan_specnet_5fold/
 
 examples/
+  Dataset_Molecular_Descriptor_Distribution_Analysis.ipynb
+  paper_35327_samples.parquet
 assets/
 results/
 ```
