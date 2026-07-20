@@ -130,12 +130,14 @@ uv run python scripts/plot_transition_evidence.py --help
 This script quantifies the **chemical interpretability** of CKAN-SpecNet by calculating enrichment factors for all 21 functional group classification tasks.
 
 ### Core Definition
-Enrichment factor quantifies whether model predictive evidence concentrates within chemically characteristic IR bands of each functional group:
+The enrichment factor quantifies concentration of model predictive signals within functional-group characteristic IR bands:
+
 $$
-\text{Enrichment} = \frac{\text{Fraction of total transition evidence falling inside target IR regions}}{\text{Fraction of full spectral axis covered by target IR regions}}
+\text{Enrichment} = \frac{\text{Fraction of total transition evidence inside target IR regions}}{\text{Fraction of full spectral axis covered by target IR regions}}
 $$
-- Enrichment > 1: Model predictive signals are enriched in chemically meaningful wavenumber ranges (desirable, physically consistent behavior).
-- Enrichment ≤ 1: Model evidence is uniformly distributed or biased toward irrelevant spectral noise.
+
+- Enrichment > 1: Model signals are enriched in chemically relevant wavenumber windows (desirable)
+- Enrichment ≤ 1: Evidence is uniformly distributed over the entire spectrum or biased toward noise
 
 ### Key Workflow
 1. Predefined characteristic IR wavenumber ranges for each functional group (parsed from the reference IR peak table).
