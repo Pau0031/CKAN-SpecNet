@@ -67,7 +67,7 @@ Unpacking the archive gives the folder structure used in the left column of the 
 | `all.parquet` (40,850 spectra) | `data/all.parquet` | `scripts/train.py --parquet` |
 | `model/manifest.json` | `models/manifest.json` | every `--run-dir models` |
 | `model/fold_1.pt` … `model/fold_5.pt` | `models/fold_1.pt` … `models/fold_5.pt` | every `--run-dir models` |
-| `raw_and_digital_comparation/row_selected_spectra.parquet` | `scripts/row_and_digital_comparation/row_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
+| `raw_and_digital_comparation/raw_selected_spectra.parquet` | `scripts/row_and_digital_comparation/raw_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
 | `raw_and_digital_comparation/digital_selected_spectra.parquet` | `scripts/row_and_digital_comparation/digital_selected_spectra.parquet` | `analyze_raw_vs_digital.py --digital` |
 | `raw_and_digital_comparation/selected_sdbs_id_smiles.csv` | `scripts/row_and_digital_comparation/selected_sdbs_id_smiles.csv` | record of the 1,000 sampled SDBS entries |
 | `raw_and_digital_comparation/digitized_results.json` | `scripts/row_and_digital_comparation/digitized_results.json` | `plot_img and load _files_plot_histograms.ipynb` |
@@ -322,7 +322,7 @@ The paper compares the same 1,000 SDBS spectra before and after image digitizati
 
 ```bash
 uv run python scripts/evaluate.py \
-    --test scripts/row_and_digital_comparation/row_selected_spectra.parquet \
+    --test scripts/row_and_digital_comparation/raw_selected_spectra.parquet \
     --run-dir models --out results/raw_1000_test_9_1
 
 uv run python scripts/evaluate.py \
@@ -334,7 +334,7 @@ uv run python scripts/evaluate.py \
 
 ```bash
 uv run python scripts/row_and_digital_comparation/analyze_raw_vs_digital.py \
-    --raw scripts/row_and_digital_comparation/row_selected_spectra.parquet \
+    --raw scripts/row_and_digital_comparation/raw_selected_spectra.parquet \
     --digital scripts/row_and_digital_comparation/digital_selected_spectra.parquet \
     --run-dir models \
     --out-dir results/anylize/raw_and_digital
@@ -427,6 +427,10 @@ label columns     functional-group presence/count labels
 ```
 
 The label columns are the 21 functional-group label columns (`alkane`, `alkene`, `alkyne`, `aromatics`, `alkyl_halides`, `alcohols`, `esters`, `ketones`, `aldehydes`, `carbonyl_oxygen`, `ether`, `acyl_halides`, `amines`, `amides`, `nitriles`, `nitro`, `isocyanate`, `isothiocyanate`, `ortho`, `meta`, `para`). They define the 33 tasks: 21 binary presence tasks, seven `_3class` count tasks (aldehydes, acyl_halides, amides, nitriles, nitro, isocyanate, isothiocyanate) and five `_4class` count tasks (alkyl_halides, alcohols, ether, amines, carbonyl_oxygen).
+
+The `amines` column follows the corrected functional-group count, in which the nitrogen atoms of nitro groups are not counted as amines.
+
+The raw-vs-digitized comparison uses two matched parquets: `raw_selected_spectra.parquet` (the spectra as taken from the source databases) and `digital_selected_spectra.parquet` (the same spectra recovered from rendered images by `scripts/digitize_epochs.py`). They share identical labels and sample identifiers and differ only in the spectral values.
 
 ## Model
 

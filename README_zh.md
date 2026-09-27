@@ -69,7 +69,7 @@ https://doi.org/10.5281/zenodo.XXXXXXX        <!-- TODO: 发布后替换为正�
 | `all.parquet`（40,850 条光谱） | `data/all.parquet` | `scripts/train.py --parquet` |
 | `model/manifest.json` | `models/manifest.json` | 所有 `--run-dir models` |
 | `model/fold_1.pt` … `model/fold_5.pt` | `models/fold_1.pt` … `models/fold_5.pt` | 所有 `--run-dir models` |
-| `raw_and_digital_comparation/row_selected_spectra.parquet` | `scripts/row_and_digital_comparation/row_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
+| `raw_and_digital_comparation/raw_selected_spectra.parquet` | `scripts/row_and_digital_comparation/raw_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
 | `raw_and_digital_comparation/digital_selected_spectra.parquet` | `scripts/row_and_digital_comparation/digital_selected_spectra.parquet` | `analyze_raw_vs_digital.py --digital` |
 | `raw_and_digital_comparation/selected_sdbs_id_smiles.csv` | `scripts/row_and_digital_comparation/selected_sdbs_id_smiles.csv` | 1000 条抽样 SDBS 记录清单 |
 | `raw_and_digital_comparation/digitized_results.json` | `scripts/row_and_digital_comparation/digitized_results.json` | `plot_img and load _files_plot_histograms.ipynb` |
@@ -324,7 +324,7 @@ uv run python scripts/check_grad_tracking.py
 
 ```bash
 uv run python scripts/evaluate.py \
-    --test scripts/row_and_digital_comparation/row_selected_spectra.parquet \
+    --test scripts/row_and_digital_comparation/raw_selected_spectra.parquet \
     --run-dir models --out results/raw_1000_test_9_1
 
 uv run python scripts/evaluate.py \
@@ -336,7 +336,7 @@ uv run python scripts/evaluate.py \
 
 ```bash
 uv run python scripts/row_and_digital_comparation/analyze_raw_vs_digital.py \
-    --raw scripts/row_and_digital_comparation/row_selected_spectra.parquet \
+    --raw scripts/row_and_digital_comparation/raw_selected_spectra.parquet \
     --digital scripts/row_and_digital_comparation/digital_selected_spectra.parquet \
     --run-dir models \
     --out-dir results/anylize/raw_and_digital
@@ -429,6 +429,10 @@ label columns     官能团标签列
 ```
 
 标签列即 21 个官能团标签列（`alkane`、`alkene`、`alkyne`、`aromatics`、`alkyl_halides`、`alcohols`、`esters`、`ketones`、`aldehydes`、`carbonyl_oxygen`、`ether`、`acyl_halides`、`amines`、`amides`、`nitriles`、`nitro`、`isocyanate`、`isothiocyanate`、`ortho`、`meta`、`para`）。它们构成 33 个任务：21 个二分类“有无”任务、7 个 `_3class` 数量任务（aldehydes、acyl_halides、amides、nitriles、nitro、isocyanate、isothiocyanate）与 5 个 `_4class` 数量任务（alkyl_halides、alcohols、ether、amines、carbonyl_oxygen）。
+
+`amines` 列采用修正后的官能团计数口径：硝基上的氮原子不计入氨基。
+
+原始谱与数字化谱对比使用两个配对的 parquet：`raw_selected_spectra.parquet`（直接取自数据源的原始谱）与 `digital_selected_spectra.parquet`（同一条光谱经 `scripts/digitize_epochs.py` 从渲染图片中还原）。两者标签与样本编号完全一致，只有光谱数值不同。
 
 ## 十六、模型结构
 
