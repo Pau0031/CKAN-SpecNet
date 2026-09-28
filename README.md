@@ -56,7 +56,7 @@ README_zh.md
 The released training corpus, the released evaluation set and the released five-fold model weights are distributed as a single archive:
 
 ```text
-https://doi.org/10.5281/zenodo.XXXXXXX        <!-- TODO: replace with the published DOI -->
+ https://doi.org/10.57760/sciencedb.0147d
 ```
 
 Unpacking the archive gives the folder structure used in the left column of the table below. Copy every file to the path in the right column:
