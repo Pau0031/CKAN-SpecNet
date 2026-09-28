@@ -29,7 +29,9 @@ ckan_specnet/                     核心代码包
   plot.py                         跃迁证据图与光谱绘图
   paths.py                        命令行路径解析工具
   grad_track.py                   少数类梯度记录 + 训练 loss 记录
-
+data/
+  exp_ftir_snapshots.csv          单独分离的28 张时序红外谱
+  100_xps_digitized.parquet       单独从test.parquet中分离出来的Laboratory FTIR (KBr pellet)数据集
 scripts/
   evaluate.py                     五折集成模型在发布测试集上的评估
   predict.py                      单样本推理
