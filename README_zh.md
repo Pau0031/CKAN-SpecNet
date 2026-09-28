@@ -67,8 +67,8 @@ README_zh.md
 
 | 下载包中的文件 | 复制到 | 被谁使用 |
 |---|---|---|
-| `test.parquet`（7,524 条光谱） | `data/test.parquet` | `scripts/evaluate.py --test`、`scripts/predict.py --test`、`scripts/plot_transition_evidence.py --test`、`scripts/compute_enrichment.py --test`、`scripts/train.py --test` |
-| `all.parquet`（40,850 条光谱） | `data/all.parquet` | `scripts/train.py --parquet` |
+| `test.parquet` | `data/test.parquet` | `scripts/evaluate.py --test`、`scripts/predict.py --test`、`scripts/plot_transition_evidence.py --test`、`scripts/compute_enrichment.py --test`、`scripts/train.py --test` |
+| `all.parquet` | `data/all.parquet` | `scripts/train.py --parquet` |
 | `model/manifest.json` | `models/manifest.json` | 所有 `--run-dir models` |
 | `model/fold_1.pt` … `model/fold_5.pt` | `models/fold_1.pt` … `models/fold_5.pt` | 所有 `--run-dir models` |
 | `raw_and_digital_comparation/raw_selected_spectra.parquet` | `scripts/row_and_digital_comparation/raw_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
