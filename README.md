@@ -67,8 +67,8 @@ Unpacking the archive gives the folder structure used in the left column of the 
 
 | File in the downloaded archive | Copy it to | Consumed by |
 |---|---|---|
-| `test.parquet` (7,524 spectra) | `data/test.parquet` | `scripts/evaluate.py --test`, `scripts/predict.py --test`, `scripts/plot_transition_evidence.py --test`, `scripts/compute_enrichment.py --test`, `scripts/train.py --test` |
-| `all.parquet` (40,850 spectra) | `data/all.parquet` | `scripts/train.py --parquet` |
+| `test.parquet` | `data/test.parquet` | `scripts/evaluate.py --test`, `scripts/predict.py --test`, `scripts/plot_transition_evidence.py --test`, `scripts/compute_enrichment.py --test`, `scripts/train.py --test` |
+| `all.parquet` | `data/all.parquet` | `scripts/train.py --parquet` |
 | `model/manifest.json` | `models/manifest.json` | every `--run-dir models` |
 | `model/fold_1.pt` … `model/fold_5.pt` | `models/fold_1.pt` … `models/fold_5.pt` | every `--run-dir models` |
 | `raw_and_digital_comparation/raw_selected_spectra.parquet` | `scripts/row_and_digital_comparation/raw_selected_spectra.parquet` | `analyze_raw_vs_digital.py --raw` |
