@@ -28,6 +28,10 @@ ckan_specnet/                     core package
   paths.py                        CLI path resolution helpers
   grad_track.py                   minority-class gradient + training-loss logging
 
+data/
+  exp_ftir_snapshots.csv          the 28 time-resolved FTIR spectra, separated out individually
+  100_xps_digitized.parquet       the Laboratory FTIR (KBr pellet) dataset separately extracted from test.parquet
+
 scripts/
   evaluate.py                     five-fold ensemble evaluation on the released test set
   predict.py                      single-sample prediction
