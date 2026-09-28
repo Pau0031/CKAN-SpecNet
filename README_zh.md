@@ -58,7 +58,7 @@ README_zh.md
 发布的训练语料、评估数据集与五折模型权重打包在同一个发布包里：
 
 ```text
-https://doi.org/10.5281/zenodo.XXXXXXX        <!-- TODO: 发布后替换为正式 DOI -->
+ https://doi.org/10.57760/sciencedb.0147d
 ```
 
 解压后得到的目录结构即下表左列。把每个文件复制到右列路径即可：
