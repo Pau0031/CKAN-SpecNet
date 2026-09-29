@@ -347,7 +347,7 @@ The notebook `scripts/row_and_digital_comparation/plot_img and load _files_plot_
 
 1. Download `https://www.swgdrug.org/IR/JCAMP_051524.zip` and extract it next to the notebook (the notebook expects `./JCAMP_051524.extracted`; only the processing code is provided here, the spectra are downloaded from SWGDRUG).
 2. The first cells read every `.jdx` file, interpolate the spectra onto the common grid `552–3842 cm⁻¹` (2 cm⁻¹ step) and write `spectral_matrix_interp.csv`.
-3. The following cells merge them with `smiles_result.txt` (released with the dataset, 831 compounds) and count the functional groups of every SMILES with RDKit, writing `full_swgdrug_data.csv`.
+3. The following cells merge them with `smiles_result.txt` (released with the dataset) and count the functional groups of every SMILES with RDKit, writing `full_swgdrug_data.csv`.
 
 ## Reaction-Monitoring Experiment (MCR-ALS)
 
