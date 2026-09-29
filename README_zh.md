@@ -406,7 +406,7 @@ _sample_id        全局唯一样本 ID（缺失时在加载阶段自动重算�
 _eval_name        评估子集标识
 label columns     官能团标签列
 ```
-## 十七、可视化示例说明
+## 十六、可视化示例说明
 
 ### 1. 跃迁证据可视化图
 
@@ -418,7 +418,7 @@ label columns     官能团标签列
 
 动图展示图片识别 → 坐标轴校正 → 曲线提取全过程；静态图输出最终数值光谱曲线。
 
-## 十八、数据来源说明
+## 十七、数据来源说明
 
 本研究数据集来源：
 
@@ -432,35 +432,3 @@ label columns     官能团标签列
 > 注意：仓库未开放全部原始数据源。因数据库、网页资源、仪器导出文件存在版权与分发限制，仅提供上文发布包中的文件用于实验复现。
 
 ---
-
-# 术语对照表（论文专用）
-
-| 英文原文 | 标准中文译名 |
-| ---- | ---- |
-| multi-task model | 多任务模型 |
-| interpretable | 可解释性 |
-| IR spectral | 红外光谱 |
-| functional-group | 官能团 |
-| coarse-grained count levels | 粗粒度数量分级 |
-| transition-evidence visualization | 跃迁证据可视化 |
-| five-fold ensemble | 五折集成模型 |
-| held-out set | 预留测试集 |
-| external dataset | 外部独立数据集 |
-| digitization | 图谱数字化 |
-| spectral region | 光谱波段/特征区间 |
-| standard deviation | 标准差 |
-| preprocessed spectrum vector | 预处理光谱向量 |
-| binary presence label | 二元有无标签 |
-| cross-validation fold | 交叉验证折次 |
-| SMILES | SMILES 分子结构式 |
-| Poly1 loss | Poly1 损失 |
-| plain cross-entropy | 普通交叉熵 |
-| class weight | 类权重 |
-| minority class | 少数类 |
-| gradient attribution | 梯度归因 |
-| enrichment factor | 富集因子 |
-| spectral fidelity | 光谱保真度 |
-| paired agreement | 配对一致性 |
-| quadratic weighted kappa (QWK) | 二次加权 kappa |
-| MCR-ALS | 多元曲线分辨-交替最小二乘 |
-| in-situ FTIR | 原位红外 |
