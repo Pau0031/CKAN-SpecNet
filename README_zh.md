@@ -350,7 +350,7 @@ notebook `scripts/row_and_digital_comparation/plot_img and load _files_plot_hist
 
 1. 下载 `https://www.swgdrug.org/IR/JCAMP_051524.zip` 并解压到 notebook 同级目录（notebook 默认读取 `./JCAMP_051524.extracted`；本仓库只提供处理代码，光谱需自行从 SWGDRUG 下载）。
 2. 前面的 cell 逐个读取 `.jdx` 文件，把光谱插值到统一网格 `552–3842 cm⁻¹`（步长 2 cm⁻¹），写出 `spectral_matrix_interp.csv`。
-3. 后续 cell 将其与 `smiles_result.txt`（随数据集发布，831 个化合物）合并，并用 RDKit 统计每条 SMILES 的官能团数量，写出 `full_swgdrug_data.csv`。
+3. 后续 cell 将其与 `smiles_result.txt`（随数据集发布）合并，并用 RDKit 统计每条 SMILES 的官能团数量，写出 `full_swgdrug_data.csv`。
 
 ## 十四、反应监测试验（MCR-ALS）
 
