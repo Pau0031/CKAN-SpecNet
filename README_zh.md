@@ -378,22 +378,11 @@ pipeline_meta.json               拟合质量与参考谱数据
 
 ## 十五、发布评估数据集说明
 
-`data/test.parquet` 是固定发布的评估数据集，共 7,524 条光谱，包含光谱向量、标签、数据来源与评估子集标识：
+`data/test.parquet` 是固定发布的评估数据集，包含光谱向量、标签、数据来源与评估子集标识：
 
-```text
-main_test        7,066 条预留 NIST/SDBS 纯化合物光谱
-swgdrug            358 条独立外部 FTIR-ATR 光谱
-xps_digitized      100 条仪器图谱数字化得到的外部光谱
-```
 
-`data/all.parquet` 是发布语料（40,850 条光谱），训练数据从中抽取：
+`data/all.parquet` 是发布的完整数据数据集，训练数据从中抽取：
 
-```text
-nist_gas         8,271
-sdbs            32,033
-swgdrug            446   （外部评估来源，不参与训练）
-xps_digitized      100   （外部评估来源，不参与训练）
-```
 
 训练只使用 SDBS 与 NIST 气相两个来源、只保留单组分光谱，并剔除所有出现在 `data/test.parquet` 中的样本。
 
@@ -429,17 +418,6 @@ _sample_id        全局唯一样本 ID（缺失时在加载阶段自动重算�
 _eval_name        评估子集标识
 label columns     官能团标签列
 ```
-
-标签列即 21 个官能团标签列（`alkane`、`alkene`、`alkyne`、`aromatics`、`alkyl_halides`、`alcohols`、`esters`、`ketones`、`aldehydes`、`carbonyl_oxygen`、`ether`、`acyl_halides`、`amines`、`amides`、`nitriles`、`nitro`、`isocyanate`、`isothiocyanate`、`ortho`、`meta`、`para`）。它们构成 33 个任务：21 个二分类“有无”任务、7 个 `_3class` 数量任务（aldehydes、acyl_halides、amides、nitriles、nitro、isocyanate、isothiocyanate）与 5 个 `_4class` 数量任务（alkyl_halides、alcohols、ether、amines、carbonyl_oxygen）。
-
-`amines` 列采用修正后的官能团计数口径：硝基上的氮原子不计入氨基。
-
-原始谱与数字化谱对比使用两个配对的 parquet：`raw_selected_spectra.parquet`（直接取自数据源的原始谱）与 `digital_selected_spectra.parquet`（同一条光谱经 `scripts/digitize_epochs.py` 从渲染图片中还原）。两者标签与样本编号完全一致，只有光谱数值不同。
-
-## 十六、模型结构
-
-发布模型由 5 个 checkpoint 按预测概率软投票集成（见 `manifest.json`，`ensemble.method = soft_voting_probability_mean`，验证集得分 96.05 ± 0.09）。网络结构为四段 CNN（32/64/128/256 通道），后两段带 ECA 注意力，自适应平均-最大池化到 64 维，接 1024 维全连接层，以及每个任务各自的预测头，其贡献分支为 KAN（`grid_size=3`、`spline_order=3`、64 个基函数、32 个隐藏单元）。
-
 ## 十七、可视化示例说明
 
 ### 1. 跃迁证据可视化图
