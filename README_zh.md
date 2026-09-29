@@ -30,8 +30,8 @@ ckan_specnet/                     核心代码包
   paths.py                        命令行路径解析工具
   grad_track.py                   少数类梯度记录 + 训练 loss 记录
 data/
-  exp_ftir_snapshots.csv          单独分离的28 张时序红外谱
-  100_xps_digitized.parquet       单独从test.parquet中分离出来的Laboratory FTIR (KBr pellet)数据集
+  exp_ftir_snapshots.csv          公开的28 张时序红外谱
+  100_xps_digitized.parquet       公开的Laboratory FTIR (KBr pellet)数据集
 scripts/
   evaluate.py                     五折集成模型在发布测试集上的评估
   predict.py                      单样本推理
@@ -60,7 +60,7 @@ README_zh.md
 发布的训练语料、评估数据集与五折模型权重打包在同一个发布包里：
 
 ```text
- https://doi.org/10.57760/sciencedb.0147d
+https://drive.google.com/file/d/1NOPdUaeULZm5JBqszAzd2S-DfEUco3dW/view?usp=drive_link
 ```
 
 解压后得到的目录结构即下表左列。把每个文件复制到右列路径即可：
@@ -79,7 +79,7 @@ README_zh.md
 | `exp_data/exp_ftir_snapshots.csv` | `scripts/exp_process/exp_ftir_snapshots.csv` | `MCR-PLS and Predict.ipynb`（28 张时序谱） |
 | `swgdrug/smiles_result.txt` | `scripts/swgdrug_data_process/smiles_result.txt` | `swgdrug_data_process.ipynb` |
 
-一句话原则：**属于哪个脚本文件夹的文件，就放进那个脚本文件夹**；只有语料、评估集和模型权重放 `data/` 与 `models/`。所有文件名保持发布时的原名，无需改名。
+只有语料、评估集和模型权重放 `data/` 与 `models/`。所有文件名保持发布时的原名，无需改名。
 
 假设发布包解压到了 `zenode/`，且当前位于仓库根目录，一次性放置命令为：
 
@@ -95,7 +95,7 @@ cp zenode/swgdrug/smiles_result.txt     scripts/swgdrug_data_process/
 
 ### 不在发布包里的输入
 
-* `analyze_p_check.py` 还需要两次由你自己跑出来的评估结果（见下文《原始谱 vs 数字化谱配对分析》）。如果这两个目录不存在，脚本会把校验结果标为 `missing`，其余分析照常运行。
+* `analyze_p_check.py` 需要两次跑出来的评估结果（原始谱 vs 数字化谱）。
 * `swgdrug_data_process.ipynb` 需要 SWGDRUG 官方 JCAMP 原始文件：下载 `https://www.swgdrug.org/IR/JCAMP_051524.zip`，解压到 notebook 同级目录，并把 notebook 里的路径指向解压出的文件夹（见下文《SWGDRUG 数据处理》）。
 
 ## 五、模型评估
