@@ -1,8 +1,8 @@
-# CKAN-SpecNet
+# CKAN-SpecNet Complete Documentation
 
-CKAN-SpecNet is an interpretable multi-task model for IR spectral functional-group analysis. It predicts both functional-group presence and coarse-grained count levels.
+CKAN-SpecNet is an interpretable multi-task model for IR spectral functional-group analysis. It simultaneously performs **functional-group presence determination** and **coarse-grained functional-group count level prediction**.
 
-The KAN component and transition-evidence visualization are used to support model interpretation by checking whether predictions rely on chemically meaningful IR spectral regions.
+The model contains a KAN (Kolmogorov-Arnold Network) module and a transition-evidence visualization tool, which are used to verify whether model predictions rely on chemically meaningful IR characteristic bands, making the model decision logic interpretable.
 
 ## Installation
 
@@ -19,51 +19,48 @@ uv sync --extra digitization
 ## Repository Layout
 
 ```text
-ckan_specnet/                     core package
-  core.py                         task catalog, model config, shared constants
-  data.py                         parquet loading, preprocessing, target building
-  model.py                        CKAN-SpecNet architecture
-  eval.py                         losses (Poly1 / CE), metrics, ensemble evaluation
-  plot.py                         transition-evidence and spectrum plotting
-  paths.py                        CLI path resolution helpers
-  grad_track.py                   minority-class gradient + training-loss logging
-
+ckan_specnet/                      core code package
+  core.py                          task catalog, model config, shared constants
+  data.py                          parquet loading, preprocessing, target building
+  model.py                         CKAN-SpecNet architecture
+  eval.py                          losses (Poly1 / CE), metrics, ensemble evaluation
+  plot.py                          transition-evidence and spectrum plotting
+  paths.py                         CLI path resolution helpers
+  grad_track.py                    minority-class gradient + training-loss logging
 data/
-  exp_ftir_snapshots.csv          the 28 time-resolved FTIR spectra, separated out individually
-  100_xps_digitized.parquet       the Laboratory FTIR (KBr pellet) dataset separately extracted from test.parquet
-
+  exp_ftir_snapshots.csv           the released 28 time-resolved FTIR spectra
+  100_xps_digitized.parquet        the released Laboratory FTIR (KBr pellet) dataset
 scripts/
-  evaluate.py                     five-fold ensemble evaluation on the released test set
-  predict.py                      single-sample prediction
-  plot_transition_evidence.py     KAN transition-evidence figures
-  compute_enrichment.py           functional-group enrichment factors
-  digitize_epochs.py              spectrum-image digitization (single image or whole folder)
-  train.py                        five-fold training (loss switching + gradient logging)
-  check_grad_tracking.py          self-check of the gradient-tracking formulas
-  exp_process/                    MCR-ALS reaction-monitoring case study
-  row_and_digital_comparation/    paired raw-vs-digitized analysis (1000 SDBS spectra)
-  swgdrug_data_process/           SWGDRUG JCAMP -> spectral matrix + SMILES pipeline
-
-examples/                         example spectrum images for the digitization demo
-assets/                           figures used by this README
+  evaluate.py                      five-fold ensemble evaluation on the released test set
+  predict.py                       single-sample prediction
+  plot_transition_evidence.py      KAN transition-evidence figures
+  compute_enrichment.py            functional-group enrichment factors
+  digitize_epochs.py               spectrum-image digitization (single image or whole folder)
+  train.py                         five-fold training (loss switching + gradient logging)
+  check_grad_tracking.py           self-check of the gradient-tracking formulas
+  exp_process/                     MCR-ALS reaction-monitoring case study
+  row_and_digital_comparation/     paired raw-vs-digitized analysis (1000 SDBS spectra)
+  swgdrug_data_process/            SWGDRUG JCAMP -> spectral matrix + SMILES pipeline
+examples/                          example spectrum images for the digitization demo
+assets/                            figures used by this document
 pyproject.toml
 README.md
 README_zh.md
 ```
 
-`data/`, `models/` and `results/` are **not** shipped with the repository: they are created when the released files are placed as described below, and they hold every input and output of the commands in this document.
+The two files already contained in the `data/` folder are two public experimental datasets.
 
 `zenode/` is only the staging folder for the dataset release and is **not** part of the repository.
 
-## Released Data and Models: What to Download and Where to Put It
+## Released Data and Models
 
-The released training corpus, the released evaluation set and the released five-fold model weights are distributed as a single archive:
+The released training corpus, evaluation dataset and five-fold model weights are distributed as a single release package:
 
 ```text
- https://doi.org/10.57760/sciencedb.0147d
+https://drive.google.com/file/d/1NOPdUaeULZm5JBqszAzd2S-DfEUco3dW/view?usp=drive_link
 ```
 
-Unpacking the archive gives the folder structure used in the left column of the table below. Copy every file to the path in the right column:
+After unpacking, the directory structure is shown in the left column of the table below. Copy each file to the path in the right column:
 
 | File in the downloaded archive | Copy it to | Consumed by |
 |---|---|---|
@@ -79,26 +76,14 @@ Unpacking the archive gives the folder structure used in the left column of the 
 | `exp_data/exp_ftir_snapshots.csv` | `scripts/exp_process/exp_ftir_snapshots.csv` | `MCR-PLS and Predict.ipynb` (28 in-situ scans) |
 | `swgdrug/smiles_result.txt` | `scripts/swgdrug_data_process/smiles_result.txt` | `swgdrug_data_process.ipynb` |
 
-In short: the files that belong to a script folder go **into that script folder**, and only the corpus, the evaluation set and the model weights go to `data/` and `models/`. File names are kept exactly as released, so no renaming is needed anywhere.
-
-Assuming the archive was unpacked into `zenode/` and you start in the repository root, the whole placement is:
-
-```bash
-mkdir -p data models
-cp zenode/test.parquet              data/test.parquet
-cp zenode/all.parquet               data/all.parquet
-cp zenode/model/fold_*.pt zenode/model/manifest.json models/
-cp zenode/raw_and_digital_comparation/* scripts/row_and_digital_comparation/
-cp zenode/exp_data/*                    scripts/exp_process/
-cp zenode/swgdrug/smiles_result.txt     scripts/swgdrug_data_process/
-```
+Only the corpus, evaluation set and model weights go to `data/` and `models/`. All filenames remain exactly as released; no renaming is needed.
 
 ### Inputs that are not part of the release
 
-* `analyze_p_check.py` additionally compares against two evaluation runs that you generate yourself (shown in *Paired Raw-vs-Digitized Analysis* below); if those folders are absent the comparison is simply reported as `missing` and the rest still runs.
-* `swgdrug_data_process.ipynb` needs the original SWGDRUG JCAMP files. Download `https://www.swgdrug.org/IR/JCAMP_051524.zip`, extract it next to the notebook and point the notebook at the extracted folder (see *SWGDRUG Data Processing* below).
+* `analyze_p_check.py` requires the two evaluation results generated by running the evaluation twice (raw spectra vs digitized spectra).
+* `swgdrug_data_process.ipynb` needs the official SWGDRUG JCAMP raw files. Download `https://www.swgdrug.org/IR/JCAMP_051524.zip`, extract it next to the notebook, and point the notebook to the extracted folder (see *SWGDRUG Data Processing* below).
 
-## Evaluation
+## Model Evaluation
 
 Run the released five-fold ensemble on the released evaluation data:
 
@@ -120,16 +105,16 @@ summary.csv                             overall metrics for each evaluation subs
 `<subset>` is one of the three evaluation subsets stored in `data/test.parquet`:
 
 ```text
-main_test        held-out NIST/SDBS pure-compound spectra
-swgdrug          independent external FTIR-ATR spectra
-xps_digitized    digitized external spectra from instrument-exported files
+main_test        held-out NIST/SDBS pure-compound standard IR spectra
+swgdrug          independent external FTIR-ATR drug spectra
+xps_digitized    external spectra obtained by digitizing instrument-exported spectra
 ```
 
 ```bash
 uv run python scripts/evaluate.py --help
 ```
 
-## Single-Sample Prediction
+## Single-Sample Prediction Inference
 
 ```bash
 uv run python scripts/predict.py --test data/test.parquet --run-dir models --eval-name main_test --sample-index 0 --out results/sample0_prediction.csv
@@ -141,23 +126,23 @@ The output CSV contains, for every one of the 33 tasks, the true class, the pred
 uv run python scripts/predict.py --help
 ```
 
-## Interpretability
+## Interpretability Tool: Transition-Evidence Visualization
 
-Transition-evidence visualization highlights the spectral regions that support a transition between functional-group classes or count levels. It is not a deterministic structural assignment, but a diagnostic plot for checking whether the model relies on reasonable IR regions.
+Transition-evidence visualization is used to highlight the key spectral regions supporting transitions between **functional-group classes/count levels**. This plot does not represent a deterministic molecular structure assignment; it is only a diagnostic tool to judge whether the model focuses on chemically reasonable IR characteristic peak regions.
 
-Automatically select a correctly predicted sample of a target class and save the figures:
+Method 1: automatically select correctly predicted samples for plotting (specify class and rank):
 
 ```bash
 uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models --eval-name main_test --task alcohols_4class --class-id 3 --rank 1 --out results/transition_evidence/alcohols_4class
 ```
 
-Use a specific sample instead:
+Method 2: plot a specified sample index:
 
 ```bash
 uv run python scripts/plot_transition_evidence.py --test data/test.parquet --run-dir models --eval-name main_test --task ketones --sample-index 6636 --out results/transition_evidence/sample6636_ketones
 ```
 
-Each transition `C<n-1> -> C<n>` up to the predicted class is written as a PNG (and PDF/TIFF) into the output folder.
+From `C<n-1> -> C<n>` level by level up to the predicted class, one PNG (and PDF/TIFF) is written into the output folder for each level.
 
 ```bash
 uv run python scripts/plot_transition_evidence.py --help
@@ -232,7 +217,7 @@ N samples                    number of valid samples used for the averaging
 uv run python scripts/compute_enrichment.py --help
 ```
 
-## Digitization
+## Spectrum Image Digitization Tool
 
 `scripts/digitize_epochs.py` converts IR spectrum images into numerical spectra. Axis tick labels are recognized with `python-doctr`, and the extracted curve is saved together with diagnostic figures. It accepts either a single image or a whole folder.
 
@@ -266,7 +251,7 @@ Supported image formats: PNG, JPG, JPEG, BMP, TIF, TIFF, WEBP, GIF.
 uv run python scripts/digitize_epochs.py --help
 ```
 
-## Training
+## Model Training
 
 ```bash
 uv run python scripts/train.py \
@@ -279,7 +264,7 @@ uv run python scripts/train.py \
 
 Samples of `data/test.parquet` are excluded from training by `_sample_id`, so the released evaluation set never leaks into a training run. The released models were trained on the 28,257 single-component SDBS/NIST spectra that remain after that exclusion (each fold trains on four fifths of them, the rest being that fold's validation split).
 
-### Loss selection
+### Loss Selection
 
 `--loss` switches between the Poly1 loss used in the paper and the plain cross-entropy control experiments:
 
@@ -291,7 +276,7 @@ ce         plain weighted cross-entropy (control experiment)
 
 Supporting switches: `--epsilon` (Poly1 epsilon), `--ce-weight` (weight of the extra CE term), `--ce-use-class-weight` (apply class weights to that extra term as well), `--class-weight balanced|none`.
 
-### Minority-class gradient and loss logging
+### Minority-Class Gradient and Loss Logging
 
 Every run writes its loss curves and the minority-class gradient statistics incrementally, so a run can be inspected while it is still going:
 
@@ -310,7 +295,7 @@ Relevant switches: `--grad-track off|logit|full` (`full` adds last-classifier-la
 uv run python scripts/train.py --help
 ```
 
-## Gradient-Tracking Self-Check
+## Gradient-Tracking Formula Self-Check
 
 `scripts/check_grad_tracking.py` verifies that every formula used by the gradient logging agrees with autograd: the three loss variants, the per-sample logits gradient, the parameter-space attribution, the gradient propagated back to the shared representation, and the minority-class selection:
 
@@ -364,9 +349,9 @@ The notebook `scripts/row_and_digital_comparation/plot_img and load _files_plot_
 2. The first cells read every `.jdx` file, interpolate the spectra onto the common grid `552–3842 cm⁻¹` (2 cm⁻¹ step) and write `spectral_matrix_interp.csv`.
 3. The following cells merge them with `smiles_result.txt` (released with the dataset, 831 compounds) and count the functional groups of every SMILES with RDKit, writing `full_swgdrug_data.csv`.
 
-## Reaction-Monitoring Case Study (MCR-ALS)
+## Reaction-Monitoring Experiment (MCR-ALS)
 
-`scripts/exp_process/MCR-PLS and Predict.ipynb` reproduces the proof-of-concept reaction-monitoring case study. With `exp_ftir_snapshots.csv` (28 in-situ scans) and `digitized_results.json` (reference spectra) placed in the same folder, it resolves the mixture with reference-guided MCR-ALS and predicts the functional-group multiplicities per scan:
+`scripts/exp_process/MCR-PLS and Predict.ipynb` reproduces the proof-of-concept reaction-monitoring experiment. With `exp_ftir_snapshots.csv` (28 in-situ scans) and `digitized_results.json` (reference spectra) placed in the same folder, it resolves the mixture with reference-guided MCR-ALS and predicts the functional-group multiplicities per scan:
 
 ```text
 contrib_mDNB/mNA/mPDA/MeOH.csv   per-scan contribution spectra C_ij * ST_j
@@ -376,111 +361,68 @@ resolved_solute_spectra.csv      solvent-free per-scan mixture spectra (not fed 
 pipeline_meta.json               fit quality and the reference-spectrum data
 ```
 
-## Released Evaluation Data
+## Released Evaluation Dataset Description
 
-`data/test.parquet` is the fixed released evaluation file. It contains 7,524 spectra, labels, source information and evaluation subset identifiers:
+`data/test.parquet` is the fixed released evaluation dataset. It contains spectrum vectors, labels, data sources and evaluation subset identifiers:
 
-```text
-main_test        7,066 held-out NIST/SDBS pure-compound spectra
-swgdrug            358 independent external FTIR-ATR spectra
-xps_digitized      100 digitized external spectra
-```
+`data/all.parquet` is the released full dataset, from which training data is drawn:
 
-`data/all.parquet` is the released corpus (40,850 spectra) from which training draws:
-
-```text
-nist_gas         8,271
-sdbs            32,033
-swgdrug            446   (external evaluation source, not used for training)
-xps_digitized      100   (external evaluation source, not used for training)
-```
-
-Training uses the SDBS and NIST gas-phase sources only, keeps single-component spectra, and removes every sample that appears in `data/test.parquet`.
+Training uses only the SDBS and NIST gas-phase sources, keeps single-component spectra, and removes every sample that appears in `data/test.parquet`.
 
 Evaluation subsets are distinguished by `_eval_name`:
 
 ```text
-main_test        held-out NIST/SDBS pure-compound spectra
+main_test        held-out NIST/SDBS pure-compound standard IR spectra
 swgdrug          independent external FTIR-ATR spectra
-xps_digitized    digitized external spectra from instrument-exported files
+xps_digitized    external spectra obtained by digitizing instrument-exported spectra
 ```
 
 The original data source of each row is stored in `source_name`:
 
 ```text
-sdbs             SDBS spectra
+sdbs             SDBS database spectra
 nist_gas         NIST gas-phase IR spectra
-swgdrug          SWGDRUG spectra
-xps_digitized    digitized external spectra
+swgdrug          SWGDRUG spectral library
+xps_digitized    digitized spectra from instrument exports
 ```
 
-Main fields:
+### Core Data Fields
 
 ```text
 spectrum          preprocessed IR spectrum vector (1,646 points, 552-3842 cm^-1, 2 cm^-1 step)
-source_name       original data source
+source_name       original data source name
 source_record_id  original source record identifier
-source_path       local source path or generated source path
+source_path       local storage path / generated path
 compound_name     compound name when available
-smiles            SMILES
+smiles            molecular SMILES structure
 component_count   number of molecular components
 sample_id         human-readable sample identifier
 _sample_id        unique sample identifier (recomputed on load when missing)
 _eval_name        evaluation subset name
-label columns     functional-group presence/count labels
+label columns     functional-group label columns
 ```
-
-The label columns are the 21 functional-group label columns (`alkane`, `alkene`, `alkyne`, `aromatics`, `alkyl_halides`, `alcohols`, `esters`, `ketones`, `aldehydes`, `carbonyl_oxygen`, `ether`, `acyl_halides`, `amines`, `amides`, `nitriles`, `nitro`, `isocyanate`, `isothiocyanate`, `ortho`, `meta`, `para`). They define the 33 tasks: 21 binary presence tasks, seven `_3class` count tasks (aldehydes, acyl_halides, amides, nitriles, nitro, isocyanate, isothiocyanate) and five `_4class` count tasks (alkyl_halides, alcohols, ether, amines, carbonyl_oxygen).
-
-The `amines` column follows the corrected functional-group count, in which the nitrogen atoms of nitro groups are not counted as amines.
-
-The raw-vs-digitized comparison uses two matched parquets: `raw_selected_spectra.parquet` (the spectra as taken from the source databases) and `digital_selected_spectra.parquet` (the same spectra recovered from rendered images by `scripts/digitize_epochs.py`). They share identical labels and sample identifiers and differ only in the spectral values.
-
-## Model
-
-The released ensemble consists of five checkpoints combined by soft voting over the predicted probabilities (`manifest.json`, `ensemble.method = soft_voting_probability_mean`, validation score 96.05 ± 0.09). The architecture is a four-block CNN (32/64/128/256 channels) with ECA attention in the last two blocks, adaptive average-maximum pooling to 64 bins, a 1,024-unit fully connected layer and a per-task head whose contribution branch is a KAN (`grid_size=3`, `spline_order=3`, 64 basis functions, 32 hidden units).
 
 ## Visual Examples
 
-### Transition Evidence
+### 1. Transition-Evidence Visualization
 
-Transition-evidence plots highlight spectral regions supporting class transitions in functional-group predictions.
+Highlighted bands in the figure represent the IR characteristic regions on which the model relies when determining a transition in the corresponding functional-group count.
 
-<p align="center">
-  <img src="assets/alcohols_C0_to_C1.png" alt="Alcohols C0 to C1" width="70%">
-</p>
+<center>Alcohols 0→1 hydroxyl transition, alcohols 1→2 hydroxyl transition, alcohols 2→3 hydroxyl transition, ketones 0→1 carbonyl transition</center>
 
-<p align="center">
-  <img src="assets/alcohols_C1_to_C2.png" alt="Alcohols C1 to C2" width="70%">
-</p>
+### 2. Spectrum Digitization Result
 
-<p align="center">
-  <img src="assets/alcohols_C2_to_C3.png" alt="Alcohols C2 to C3" width="70%">
-</p>
+The animated figure shows the whole process of image recognition → axis calibration → curve extraction; the static figure outputs the final numerical spectrum curve.
 
-<p align="center">
-  <img src="assets/ketones_C0_to_C1.png" alt="Ketones C0 to C1" width="70%">
-</p>
+## Data Source Description
 
-### Spectrum Digitization
+The data sources of this study are:
 
-<p align="center">
-  <img src="assets/example.gif" alt="Digitization example" width="70%">
-</p>
+1. NIST Chemistry WebBook: https://webbook.nist.gov/chemistry/
+2. SDBS database: https://sdbs.db.aist.go.jp
+3. SDBS acquisition tool adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
+4. SWGDRUG spectral library: https://www.swgdrug.org
 
-<p align="center">
-  <img src="assets/digitize.png" alt="Digitized spectrum" width="70%">
-</p>
+The released `data/test.parquet` also contains spectra obtained by digitizing commercial instrument-exported spectra.
 
-## Data Sources
-
-The data used in this study were collected from:
-
-- NIST Chemistry WebBook: https://webbook.nist.gov/chemistry/
-- SDBS: https://sdbs.db.aist.go.jp
-- SDBS acquisition method adapted from spectra-scraper: https://github.com/jgmotta98/spectra-scraper
-- SWGDRUG: https://www.swgdrug.org
-
-The released `data/test.parquet` also contains digitized spectra from commercial instrument exports.
-
-Some raw data are not redistributed in this repository because the original databases, web materials or instrument-exported files may have their own access, licensing or redistribution restrictions. The released files in the archive described above are provided for direct reproduction.
+> Note: The repository does not release all original data sources. Due to copyright and distribution restrictions of databases, web resources, and instrument-exported files, only the files in the release package above are provided for experimental reproduction.
