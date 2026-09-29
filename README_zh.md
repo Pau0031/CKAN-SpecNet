@@ -81,18 +81,6 @@ https://drive.google.com/file/d/1NOPdUaeULZm5JBqszAzd2S-DfEUco3dW/view?usp=drive
 
 只有语料、评估集和模型权重放 `data/` 与 `models/`。所有文件名保持发布时的原名，无需改名。
 
-假设发布包解压到了 `zenode/`，且当前位于仓库根目录，一次性放置命令为：
-
-```bash
-mkdir -p data models
-cp zenode/test.parquet              data/test.parquet
-cp zenode/all.parquet               data/all.parquet
-cp zenode/model/fold_*.pt zenode/model/manifest.json models/
-cp zenode/raw_and_digital_comparation/* scripts/row_and_digital_comparation/
-cp zenode/exp_data/*                    scripts/exp_process/
-cp zenode/swgdrug/smiles_result.txt     scripts/swgdrug_data_process/
-```
-
 ### 不在发布包里的输入
 
 * `analyze_p_check.py` 需要两次跑出来的评估结果（原始谱 vs 数字化谱）。
