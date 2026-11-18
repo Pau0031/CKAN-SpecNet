@@ -81,7 +81,7 @@ https://doi.org/10.5281/zenodo.XXXXXXX        <!-- TODO: 发布后替换为正�
 | `exp_data/exp_ftir_snapshots.csv` | `scripts/exp_process/exp_ftir_snapshots.csv` | `MCR-PLS and Predict.ipynb`（28 张时序谱） |
 | `swgdrug/smiles_result.txt` | `scripts/swgdrug_data_process/smiles_result.txt` | `swgdrug_data_process.ipynb` |
 
-一句话原则：**属于哪个脚本文件夹的文件，就放进那个脚本文件夹**；只有语料、评估集和模型权重放 `data/` 与 `models/`。所有文件名保持发布时的原名，无需改名。
+只有语料、评估集和模型权重放 `data/` 与 `models/`。所有文件名保持发布时的原名，无需改名，其他见上面的对应文件存放。
 
 假设发布包解压到了 `zenode/`，且当前位于仓库根目录，一次性放置命令为：
 
