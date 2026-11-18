@@ -79,7 +79,7 @@ Unpacking the archive gives the folder structure used in the left column of the 
 | `exp_data/exp_ftir_snapshots.csv` | `scripts/exp_process/exp_ftir_snapshots.csv` | `MCR-PLS and Predict.ipynb` (28 in-situ scans) |
 | `swgdrug/smiles_result.txt` | `scripts/swgdrug_data_process/smiles_result.txt` | `swgdrug_data_process.ipynb` |
 
-In short: the files that belong to a script folder go **into that script folder**, and only the corpus, the evaluation set and the model weights go to `data/` and `models/`. File names are kept exactly as released, so no renaming is needed anywhere.
+Only the corpus, the evaluation set and the model weights go to `data/` and `models/`. File names are kept exactly as released, so no renaming is needed anywhere.
 
 Assuming the archive was unpacked into `zenode/` and you start in the repository root, the whole placement is:
 
