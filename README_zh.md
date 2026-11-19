@@ -1,8 +1,8 @@
-# CKAN-SpecNet 完整中文文档
+# MIR-ContribKAN 完整中文文档
 
 ## 一、项目简介
 
-CKAN-SpecNet 是一款具备可解释性的多任务红外光谱官能团分析模型，可同时完成**官能团有无判定**与**粗粒度官能团数量分级预测**两大任务。
+MIR-ContribKAN 是一款具备可解释性的多任务红外光谱官能团分析模型，可同时完成**官能团有无判定**与**粗粒度官能团数量分级预测**两大任务。
 
 模型内置 KAN（Kolmogorov-Arnold Network）模块，并配套**跃迁证据可视化**工具，用于验证模型预测是否依赖化学上具备物理意义的红外特征波段，实现模型决策逻辑可解释。
 
@@ -24,7 +24,7 @@ uv sync --extra digitization
 ckan_specnet/                     核心代码包
   core.py                         任务目录、模型配置、公共常量
   data.py                         parquet 读取、预处理、标签构建
-  model.py                        CKAN-SpecNet 模型结构
+  model.py                        MIR-ContribKAN 模型结构
   eval.py                         loss（Poly1 / 交叉熵）、指标、集成评估
   plot.py                         跃迁证据图与光谱绘图
   paths.py                        命令行路径解析工具
@@ -167,7 +167,7 @@ uv run python scripts/plot_transition_evidence.py --help
 
 ## 八、官能团富集因子计算
 
-该脚本通过计算全部 21 个官能团分类任务的富集因子，量化 CKAN-SpecNet 的**化学可解释性**。
+该脚本通过计算全部 21 个官能团分类任务的富集因子，量化 MIR-ContribKAN 的**化学可解释性**。
 
 ### 核心定义
 
