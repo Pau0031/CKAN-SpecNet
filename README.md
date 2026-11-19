@@ -1,6 +1,6 @@
-# CKAN-SpecNet
+# MIR-ContribKAN
 
-CKAN-SpecNet is an interpretable multi-task model for IR spectral functional-group analysis. It predicts both functional-group presence and coarse-grained count levels.
+MIR-ContribKAN is an interpretable multi-task model for IR spectral functional-group analysis. It predicts both functional-group presence and coarse-grained count levels.
 
 The KAN component and transition-evidence visualization are used to support model interpretation by checking whether predictions rely on chemically meaningful IR spectral regions.
 
@@ -22,7 +22,7 @@ uv sync --extra digitization
 ckan_specnet/                     core package
   core.py                         task catalog, model config, shared constants
   data.py                         parquet loading, preprocessing, target building
-  model.py                        CKAN-SpecNet architecture
+  model.py                        MIR-ContribKAN architecture
   eval.py                         losses (Poly1 / CE), metrics, ensemble evaluation
   plot.py                         transition-evidence and spectrum plotting
   paths.py                        CLI path resolution helpers
@@ -165,7 +165,7 @@ uv run python scripts/plot_transition_evidence.py --help
 
 ## Functional-Group Enrichment Factor Calculation
 
-This script quantifies the **chemical interpretability** of CKAN-SpecNet by calculating enrichment factors for all 21 functional-group classification tasks.
+This script quantifies the **chemical interpretability** of MIR-ContribKAN by calculating enrichment factors for all 21 functional-group classification tasks.
 
 ### Core Definition
 
